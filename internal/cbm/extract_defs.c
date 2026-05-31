@@ -619,6 +619,15 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
+        // PowerShell function_statement has no `name` field; the name is a
+        // `function_name` child node (#35).
+        if (lang == CBM_LANG_POWERSHELL && strcmp(kind, "function_statement") == 0) {
+            TSNode fn = cbm_find_child_by_kind(node, "function_name");
+            if (!ts_node_is_null(fn)) {
+                return fn;
+            }
+        }
+
         {
             TSNode r = resolve_toplevel_arrow_name(node, kind);
             if (!ts_node_is_null(r)) {

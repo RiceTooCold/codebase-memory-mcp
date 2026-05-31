@@ -152,6 +152,68 @@ TEST(extract_cpp_macros_issue375) {
     PASS();
 }
 
+/* --- GDScript: AST -> graph visitor (Godot, #186) --- */
+TEST(extract_gdscript_issue186) {
+    CBMFileResult *r = extract("extends Node\n"
+                               "class_name Player\n"
+                               "\n"
+                               "var health = 100\n"
+                               "\n"
+                               "func _ready():\n"
+                               "    take_damage(10)\n"
+                               "\n"
+                               "func take_damage(amount):\n"
+                               "    health -= amount\n"
+                               "\n"
+                               "class Inner:\n"
+                               "    func helper():\n"
+                               "        pass\n",
+                               CBM_LANG_GDSCRIPT, "game", "player.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "_ready"));
+    ASSERT(has_def(r, "Function", "take_damage"));
+    ASSERT(has_def(r, "Class", "Inner"));
+    ASSERT(has_call(r, "take_damage"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- PowerShell: AST -> graph visitor (#35) --- */
+TEST(extract_powershell_issue35) {
+    CBMFileResult *r = extract("function Get-Greeting {\n"
+                               "    param($Name)\n"
+                               "    Write-Output \"Hello $Name\"\n"
+                               "}\n"
+                               "\n"
+                               "function Set-Config {\n"
+                               "    Get-Greeting -Name 'World'\n"
+                               "}\n",
+                               CBM_LANG_POWERSHELL, "ops", "greet.ps1");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(count_defs_with_label(r, "Function") >= 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- Luau: AST -> graph visitor (Roblox, #39) --- */
+TEST(extract_luau_issue39) {
+    CBMFileResult *r = extract("local function add(a, b)\n"
+                               "    return a + b\n"
+                               "end\n"
+                               "\n"
+                               "function multiply(a, b)\n"
+                               "    return add(a, a) * b\n"
+                               "end\n",
+                               CBM_LANG_LUAU, "game", "math.luau");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(count_defs_with_label(r, "Function") >= 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Java --- */
 TEST(java_class) {
     CBMFileResult *r = extract(
@@ -2419,6 +2481,9 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_factory_object_methods_issue341);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
+    RUN_TEST(extract_gdscript_issue186);
+    RUN_TEST(extract_powershell_issue35);
+    RUN_TEST(extract_luau_issue39);
 
     /* OOP */
     RUN_TEST(java_class);

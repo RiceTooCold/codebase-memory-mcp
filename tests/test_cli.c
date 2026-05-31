@@ -1501,6 +1501,43 @@ TEST(cli_detect_agents_finds_cursor_issue222) {
     PASS();
 }
 
+/* issue #388: `install --plan` must emit a machine-readable receipt of planned
+ * writes WITHOUT mutating any config (the pre-mutation trust primitive). */
+TEST(cli_install_plan_receipt_no_mutation_issue388) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-plan-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    /* Make Cursor + Codex "detected". */
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
+    test_mkdirp(dir);
+    snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
+    test_mkdirp(dir);
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
+    ASSERT(strstr(json, "writes_started") != NULL);
+    ASSERT(strstr(json, "next_safe_command") != NULL);
+    ASSERT(strstr(json, "cursor") != NULL);
+    ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
+    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    free(json);
+
+    /* Critical: building the plan must NOT have created any config file. */
+    char cfg[512];
+    struct stat st;
+    snprintf(cfg, sizeof(cfg), "%s/.cursor/mcp.json", tmpdir);
+    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
+    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_detect_agents_finds_gemini) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -2571,6 +2608,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
+    RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);

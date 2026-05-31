@@ -2768,6 +2768,45 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
 }
 
 /* Install Claude Code-specific configs (skills, MCP, hooks). */
+/* ── Install plan recorder (issue #388) ────────────────────────────
+ * When g_install_plan != NULL, the install path runs as a dry-run and each
+ * write site records its planned target HERE — at the same point it would
+ * perform the write — so the emitted plan cannot drift from actual install
+ * behavior (it is the same code path with mutations disabled). */
+typedef struct {
+    char agent[CLI_BUF_32];
+    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
+    char path[CLI_BUF_1K];
+} cbm_plan_entry_t;
+
+typedef struct {
+    cbm_plan_entry_t *items;
+    int count;
+    int cap;
+} cbm_install_plan_t;
+
+static cbm_install_plan_t *g_install_plan = NULL;
+
+static void plan_record(const char *agent, const char *kind, const char *path) {
+    if (!g_install_plan || !path || !path[0]) {
+        return;
+    }
+    cbm_install_plan_t *pl = g_install_plan;
+    if (pl->count >= pl->cap) {
+        int ncap = pl->cap ? pl->cap * 2 : CLI_BUF_16;
+        cbm_plan_entry_t *ni = realloc(pl->items, (size_t)ncap * sizeof(*ni));
+        if (!ni) {
+            return;
+        }
+        pl->items = ni;
+        pl->cap = ncap;
+    }
+    cbm_plan_entry_t *e = &pl->items[pl->count++];
+    snprintf(e->agent, sizeof(e->agent), "%s", agent);
+    snprintf(e->kind, sizeof(e->kind), "%s", kind);
+    snprintf(e->path, sizeof(e->path), "%s", path);
+}
+
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
                                        bool dry_run) {
     char config_dir[CLI_BUF_1K];
@@ -2777,6 +2816,24 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     char skills_dir[CLI_BUF_1K];
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+
+    /* Plan mode: record the planned writes and return without mutating (#388). */
+    if (g_install_plan) {
+        char p[CLI_BUF_1K];
+        plan_record("Claude Code", "skills", skills_dir);
+        snprintf(p, sizeof(p), "%s/.mcp.json", config_dir);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/.claude.json", user_root);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/settings.json", config_dir);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+        plan_record("Claude Code", "hook", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
+        plan_record("Claude Code", "hook", p);
+        return;
+    }
+
     printf("Claude Code:\n");
 
     int skill_count = cbm_install_skills(skills_dir, force, dry_run);
@@ -2831,6 +2888,14 @@ static void install_generic_agent_config(const char *label, const char *binary_p
                                          const char *config_path, const char *instr_path,
                                          bool dry_run,
                                          int (*install_mcp)(const char *, const char *)) {
+    /* Plan mode: record planned writes, mutate nothing (#388). */
+    if (g_install_plan) {
+        plan_record(label, "mcp_config", config_path);
+        if (instr_path) {
+            plan_record(label, "instructions", instr_path);
+        }
+        return;
+    }
     printf("%s:\n", label);
     if (!dry_run) {
         install_mcp(binary_path, config_path);
@@ -2853,6 +2918,9 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
     snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
     install_generic_agent_config("Gemini CLI", binary_path, cp, ip, dry_run,
                                  cbm_install_editor_mcp);
+    if (g_install_plan) {
+        return; /* config recorded by install_generic_agent_config above */
+    }
     if (!dry_run) {
         cbm_upsert_gemini_hooks(cp);
     }
@@ -2891,11 +2959,15 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
     if (agents->aider) {
         char ip[CLI_BUF_1K];
         snprintf(ip, sizeof(ip), "%s/CONVENTIONS.md", home);
-        printf("Aider:\n");
-        if (!dry_run) {
-            cbm_upsert_instructions(ip, agent_instructions_content);
+        if (g_install_plan) {
+            plan_record("Aider", "instructions", ip);
+        } else {
+            printf("Aider:\n");
+            if (!dry_run) {
+                cbm_upsert_instructions(ip, agent_instructions_content);
+            }
+            printf("  instructions: %s\n", ip);
         }
-        printf("  instructions: %s\n", ip);
     }
 }
 
@@ -2968,7 +3040,9 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
 static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
                                       bool dry_run) {
     cbm_detected_agents_t agents = cbm_detect_agents(home);
-    print_detected_agents(&agents);
+    if (!g_install_plan) {
+        print_detected_agents(&agents);
+    }
 
     if (agents.claude_code) {
         install_claude_code_config(home, binary_path, force, dry_run);
@@ -3027,10 +3101,88 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     }
 }
 
+/* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
+ * the config / instruction / hook files `install` WOULD write, produced by
+ * running the real install dispatch in record-only mode (no mutation, no
+ * network). Returns a heap JSON string (caller frees) or NULL. */
+char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
+    if (!home || !binary_path) {
+        return NULL;
+    }
+
+    /* Same code path as a real install, but mutations disabled and every write
+     * site records into `plan` — so the receipt cannot drift from behavior. */
+    cbm_install_plan_t plan = {0};
+    g_install_plan = &plan;
+    cbm_install_agent_configs(home, binary_path, false, true);
+    g_install_plan = NULL;
+
+    cbm_detected_agents_t det = cbm_detect_agents(home);
+    struct {
+        bool flag;
+        const char *name;
+    } names[] = {
+        {det.claude_code, "claude-code"},
+        {det.codex, "codex"},
+        {det.gemini, "gemini"},
+        {det.zed, "zed"},
+        {det.opencode, "opencode"},
+        {det.antigravity, "antigravity"},
+        {det.aider, "aider"},
+        {det.kilocode, "kilocode"},
+        {det.vscode, "vscode"},
+        {det.cursor, "cursor"},
+        {det.openclaw, "openclaw"},
+        {det.kiro, "kiro"},
+    };
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
+
+    yyjson_mut_val *agents = yyjson_mut_arr(doc);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].flag) {
+            yyjson_mut_arr_add_str(doc, agents, names[i].name);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "agents_detected", agents);
+
+    yyjson_mut_val *configs = yyjson_mut_arr(doc);
+    yyjson_mut_val *instrs = yyjson_mut_arr(doc);
+    yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    for (int i = 0; i < plan.count; i++) {
+        cbm_plan_entry_t *e = &plan.items[i];
+        if (strcmp(e->kind, "mcp_config") == 0) {
+            yyjson_mut_arr_add_strcpy(doc, configs, e->path);
+        } else if (strcmp(e->kind, "hook") == 0) {
+            yyjson_mut_val *h = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
+            yyjson_mut_obj_add_strcpy(doc, h, "path", e->path);
+            yyjson_mut_arr_add_val(hooks, h);
+        } else {
+            yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
+    yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
+    yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
+    yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
+    yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
+
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL);
+    yyjson_mut_doc_free(doc);
+    free(plan.items);
+    return json; /* malloc'd; caller frees */
+}
+
 int cbm_cmd_install(int argc, char **argv) {
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
+    bool plan = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -3038,12 +3190,31 @@ int cbm_cmd_install(int argc, char **argv) {
         if (strcmp(argv[i], "--force") == 0) {
             force = true;
         }
+        if (strcmp(argv[i], "--plan") == 0) {
+            plan = true;
+        }
     }
 
     const char *home = cbm_get_home_dir();
     if (!home) {
         (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
         return CLI_TRUE;
+    }
+
+    /* --plan: emit the machine-readable install receipt and exit WITHOUT
+     * mutating anything (no config writes, no index deletion, no network) so
+     * an agent can inspect exactly what install would touch first (#388). */
+    if (plan) {
+        char self_path[CLI_BUF_1K] = {0};
+        cbm_detect_self_path(self_path, sizeof(self_path), home);
+        char *json = cbm_build_install_plan_json(home, self_path);
+        if (!json) {
+            (void)fprintf(stderr, "error: failed to build install plan\n");
+            return CLI_TRUE;
+        }
+        printf("%s\n", json);
+        free(json);
+        return 0;
     }
 
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);

@@ -23,6 +23,7 @@ enum {
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
 #include "graph_buffer/graph_buffer.h"
+#include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
@@ -1170,21 +1171,28 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
 /* ── Dump / Flush ────────────────────────────────────────────────── */
 
 /* Extract url_path value from a properties JSON string.
- * Returns heap-allocated string or NULL. Caller must free. */
+ * Returns heap-allocated string or NULL. Caller must free.
+ * Parses real JSON: the dump writer feeds this value into idx_edges_url_path,
+ * whose backing column is GENERATED AS json_extract(properties,'$.url_path').
+ * Naive byte slicing returned the ESCAPED text (and cut at embedded \\")
+ * while json_extract yields the unescaped value — the mismatch left rows
+ * "missing from index idx_edges_url_path" under PRAGMA integrity_check. */
 static char *extract_url_path(const char *props) {
-    if (!props) {
+    if (!props || !strstr(props, "\"url_path\"")) {
         return NULL;
     }
-    const char *key = strstr(props, "\"url_path\":\"");
-    if (!key) {
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    if (!doc) {
         return NULL;
     }
-    key += GB_URL_PATH_PREFIX; /* strlen("\"url_path\":\"") */
-    const char *end = strchr(key, '"');
-    if (!end || end <= key) {
-        return NULL;
+    char *out = NULL;
+    yyjson_val *v = yyjson_obj_get(yyjson_doc_get_root(doc), "url_path");
+    if (v && yyjson_is_str(v)) {
+        const char *sv = yyjson_get_str(v);
+        out = cbm_strndup(sv, strlen(sv));
     }
-    return cbm_strndup(key, (size_t)(end - key));
+    yyjson_doc_free(doc);
+    return out;
 }
 
 /* Remap a temp edge ID to its final sequential ID, or 0 if out of range. */

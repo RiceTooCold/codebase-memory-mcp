@@ -74,6 +74,7 @@ extern void suite_worker_pool(void);
 extern void suite_parallel(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
+extern void suite_httpd(void);
 extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
@@ -210,6 +211,9 @@ int main(void) {
 
     /* UI (config, embedded assets, layout) */
     RUN_SUITE(ui);
+
+    /* UI HTTP server (transport + routing) */
+    RUN_SUITE(httpd);
 
     /* Security defenses */
     RUN_SUITE(security);

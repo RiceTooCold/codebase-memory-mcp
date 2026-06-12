@@ -38,8 +38,6 @@ a96a1acc75fd6595811b28420cf0495b87fac98c4dbc73aa0d742b6824f607c8  /Users/martinv
 16825bbc252de422982b5728df7eda181d952824f5e3ce958c7fc85feae64b8e  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/mimalloc/src/stats.c
 7f76bcace4b0578f2063477752138adabd99f7b10a276998e296a312c47a7cfe  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/mimalloc/src/theap.c
 49be69a4b674e09690a63870830f3ffb05698ed4210949ef5add11957a08325b  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/mimalloc/src/threadlocal.c
-cb23c6e2782eb6a115beb0bb41d66dfb31ccf9eeb4b0950788895dc9963ccda3  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/mongoose/mongoose.c
-008e31c8006e42983e0f3d7efbf123101de817d9eabe55a2c051159d2da59f19  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/mongoose/mongoose.h
 dab3009c0d76b0c5e05ad8abc7c9f8f6effca547fea3c0394be96418a85c1081  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/nomic/code_tokens.h
 494d329d06e33904e6264b1f9d1cc82de2c6bb212f8d78ba281b7e1eb1179b61  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/nomic/code_vectors.h
 9512509b1bccb7461f79bea8aad6280ae4699e925fa4804381b71f59e7efb0c5  /Users/martinvogel/project_dir/codebase-memory-mcp/vendored/sqlite3/sqlite3.c

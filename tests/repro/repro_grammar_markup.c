@@ -465,8 +465,11 @@ TEST(repro_grammar_markup_markdown) {
         "- item one\n"
         "- item two\n";
     static const char bad[] = "# Heading\n```unterminated code fence\n";
+    /* A heading is a "Section" (a valid label), NOT a "Class" — production
+     * correctly mints "Section"; assert the accurate label rather than degrade
+     * the graph to "Class". */
     if (markup_struct_battery("Markdown", src, CBM_LANG_MARKDOWN, "README.md",
-                              "Class", NULL) != 0)
+                              "Section", NULL) != 0)
         return 1;
     return markup_robustness("Markdown", bad, CBM_LANG_MARKDOWN, "README.md");
 }

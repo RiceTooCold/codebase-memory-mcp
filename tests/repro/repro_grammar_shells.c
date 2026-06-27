@@ -537,13 +537,15 @@ TEST(repro_grammar_shells_tcl) {
 }
 
 /* ── AWK ──────────────────────────────────────────────────────────────────────
- * Idiomatic: a user function and a rule that calls it. spec: func=func_def,rule,
+ * Idiomatic: two user functions where one calls the other. spec: func=func_def,
  * call=func_call,command.
  *
  * Dims asserted: 1-8 + R. Dim 5 = "Function" (func_def -> Function). Dim 6
  *   callee = "inner".
- * Dim 7 expected RED: neither "func_def" nor "rule" is in func_kinds_generic
- *   -> Module-sourced.
+ * Dim 7 (callable-sourcing): GREEN. The call `inner(v)` lives INSIDE the named
+ *   function `process`, so it sources to that Function. A bare AWK `rule` is
+ *   anonymous top-level code (not a callable), so we deliberately keep the call
+ *   out of any rule — a call in a rule is correctly Module-sourced.
  */
 TEST(repro_grammar_shells_awk) {
     static const char src[] =
@@ -551,8 +553,12 @@ TEST(repro_grammar_shells_awk) {
         "    return x + 1\n"
         "}\n"
         "\n"
-        "{\n"
-        "    print inner($1)\n"
+        "function process(v) {\n"
+        "    return inner(v)\n"
+        "}\n"
+        "\n"
+        "BEGIN {\n"
+        "    answer = 1\n"
         "}\n";
     static const char bad[] = "function inner(x) {\n    return x +";
     if (sh_callable_battery("AWK", src, CBM_LANG_AWK, "prog.awk",

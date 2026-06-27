@@ -1082,7 +1082,11 @@ static const char *fish_branch_types[] = {"if_statement", "switch_statement", "w
                                           "for_statement", NULL};
 static const char *fish_var_types[] = {"variable", NULL};
 static const char *fish_module_types[] = {"program", NULL};
-static const char *awk_func_types[] = {"func_def", "rule", NULL};
+/* Only `func_def` (a named `function f(){}`) is a callable. A `rule` (`{...}` /
+ * `/re/{...}` / BEGIN/END) is ANONYMOUS top-level executable code — it cannot be
+ * called by name, so a call inside a rule is legitimately Module-sourced, and a
+ * rule must NOT be treated as a function boundary. */
+static const char *awk_func_types[] = {"func_def", NULL};
 static const char *awk_call_types[] = {"func_call", "command", NULL};
 static const char *awk_branch_types[] = {"if_statement",
                                          "for_statement",

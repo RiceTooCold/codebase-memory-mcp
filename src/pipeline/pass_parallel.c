@@ -1863,6 +1863,31 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
+         * service signal lives in the callee_name. The registry can mis-resolve
+         * it to a spurious builtin short-name match (`requests.get` ->
+         * `builtins.dict.get` via "get"), which is non-empty and not an HTTP
+         * pattern, so the resolved-QN service checks below miss it and the call
+         * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
+         * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
+         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+        if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
+            const char *cu = call->first_string_arg;
+            bool chas_url = cu && cu[0] != '\0' &&
+                            (cu[0] == '/' || strstr(cu, "://") != NULL ||
+                             (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
+            if (chas_url) {
+                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                            .confidence = PP_HALF_CONF,
+                                            .strategy = "service_pattern"};
+                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
+                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                  imp_count);
+                continue;
+            }
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,

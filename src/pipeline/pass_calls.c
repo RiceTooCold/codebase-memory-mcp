@@ -445,6 +445,30 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
+    /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service
+     * signal lives in the callee_name. The registry can mis-resolve such a call
+     * to a spurious builtin short-name match (e.g. `requests.get` ->
+     * `builtins.dict.get` via "get", strategy unique_name), which is non-empty
+     * and not an HTTP pattern, so BOTH the empty-resolution and resolved-QN
+     * service checks below miss it and the call is dropped. Detect it on the
+     * callee_name FIRST so the HTTP_CALLS/ASYNC_CALLS edge is emitted regardless
+     * (target is a synthesized route node, not the unindexed library). (#523) */
+    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
+        const char *cu = call->first_string_arg;
+        bool chas_url = cu && cu[0] != '\0' &&
+                        (cu[0] == '/' || strstr(cu, "://") != NULL ||
+                         (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
+        if (chas_url) {
+            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                        .confidence = PC_SVC_PATTERN_CONF,
+                                        .strategy = "service_pattern",
+                                        .candidate_count = 0};
+            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc);
+            return SKIP_ONE;
+        }
+    }
+
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {

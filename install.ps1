@@ -31,16 +31,26 @@ foreach ($arg in $args) {
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
 
+# Detect architecture (ARM64 vs x64). PROCESSOR_ARCHITEW6432 is set to ARM64
+# when an x86/x64 process runs under emulation on ARM hardware, so check both to
+# resolve ARM64 even from an emulated shell; anything else falls back to amd64.
+if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+    $Arch = "arm64"
+} else {
+    $Arch = "amd64"
+}
+
 Write-Host "codebase-memory-mcp installer (Windows)"
 Write-Host "  variant: $Variant"
+Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
 # Build download URL
 if ($Variant -eq "ui") {
-    $Archive = "codebase-memory-mcp-ui-windows-amd64.zip"
+    $Archive = "codebase-memory-mcp-ui-windows-$Arch.zip"
 } else {
-    $Archive = "codebase-memory-mcp-windows-amd64.zip"
+    $Archive = "codebase-memory-mcp-windows-$Arch.zip"
 }
 $Url = "$BaseUrl/$Archive"
 

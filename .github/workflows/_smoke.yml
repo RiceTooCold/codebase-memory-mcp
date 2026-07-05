@@ -37,20 +37,24 @@ jobs:
             {"os":"macos-14","goos":"darwin","goarch":"arm64"},
             {"os":"macos-15-intel","goos":"darwin","goarch":"amd64"}
           ]'
-          # Broad legs reuse existing goos/goarch artifacts on newer/older OS
-          # versions (e.g. ubuntu-22.04 = older glibc) to widen the run-anywhere
-          # signal without building new targets.
+          # Broad legs reuse existing goos/goarch artifacts on additional OS
+          # versions to widen the run-anywhere signal without building new targets.
           # Broad legs are REQUIRED gates (no optional / continue-on-error):
           # every smoke leg must pass. No `optional` flags anywhere.
+          #
+          # NOTE: the *dynamic* linux binary links glibc 2.38+ and cannot run on
+          # older distros by design — older-glibc coverage is the -portable (static)
+          # binary's job, exercised green by the smoke-linux-portable broad legs
+          # (ubuntu-22.04 / 22.04-arm). So the dynamic broad legs stay on
+          # forward-compatible OSes only (macOS); running the dynamic binary on
+          # ubuntu-22.04 would fail Phase 1 (glibc too old), not a real regression.
           BROAD_UNIX='[
-            {"os":"ubuntu-22.04","goos":"linux","goarch":"amd64"},
-            {"os":"ubuntu-22.04-arm","goos":"linux","goarch":"arm64"},
             {"os":"macos-15","goos":"darwin","goarch":"arm64"}
           ]'
-          CORE_WIN='[{"os":"windows-latest"}]'
-          # windows-11-arm runs the shipped x86_64 binary under emulation —
-          # verifies the Windows artifact still launches on ARM hardware.
-          BROAD_WIN='[{"os":"windows-2025"},{"os":"windows-11-arm"}]'
+          CORE_WIN='[{"os":"windows-latest","arch":"amd64"}]'
+          # windows-11-arm now runs the NATIVE arm64 binary (build-windows-arm64),
+          # not the x86_64 binary under emulation — we smoke the artifact we ship.
+          BROAD_WIN='[{"os":"windows-2025","arch":"amd64"},{"os":"windows-11-arm","arch":"arm64"}]'
           CORE_PORTABLE='[
             {"arch":"amd64","runner":"ubuntu-latest"},
             {"arch":"arm64","runner":"ubuntu-24.04-arm"}
@@ -152,6 +156,10 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
+          # apt auto-starts the clamav-freshclam daemon, which holds a lock on
+          # freshclam's log/db; stop it so the manual freshclam below can run
+          # (else: "Failed to lock the log file ... Resource temporarily unavailable").
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
           sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
           grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
             echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
@@ -183,23 +191,24 @@ jobs:
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
-          msystem: CLANG64
+          msystem: ${{ matrix.arch == 'arm64' && 'CLANGARM64' || 'CLANG64' }}
           path-type: inherit
           install: >-
-            mingw-w64-clang-x86_64-python3
+            mingw-w64-clang-${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}-python3
             unzip
             zip
             coreutils
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: binaries-windows-amd64
+          name: binaries-windows-${{ matrix.arch }}
 
       - name: Extract binary
         shell: msys2 {0}
         run: |
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          unzip -o "codebase-memory-mcp${SUFFIX}-windows-amd64.zip"
+          ARCH=${{ matrix.arch }}
+          unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip"
           [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
 
       - name: Start artifact server
@@ -208,10 +217,11 @@ jobs:
           mkdir -p /tmp/smoke-server
           cp codebase-memory-mcp.exe /tmp/smoke-server/
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          ARCH=${{ matrix.arch }}
           cd /tmp/smoke-server
-          zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
+          zip -q "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" codebase-memory-mcp.exe
           if [ -n "$SUFFIX" ]; then
-            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
+            cp "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" "codebase-memory-mcp-windows-${ARCH}.zip"
           fi
           sha256sum *.zip > checksums.txt
           python3 -m http.server 18080 -d /tmp/smoke-server &

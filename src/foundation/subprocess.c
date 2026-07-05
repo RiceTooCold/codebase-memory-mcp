@@ -13,6 +13,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "win_utf8.h" /* cbm_utf8_to_wide — spawn the worker with a wide command line so a
+                       * non-ASCII repo path survives CreateProcess (#423/#20) */
+#include <stdlib.h>   /* free */
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -235,9 +238,20 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         out->term_signal = 0;
         return -1;
     }
+    /* Spawn via CreateProcessW with a WIDE command line. CreateProcessA would
+     * re-interpret our UTF-8 cmdline bytes through the ANSI code page (CP_ACP),
+     * re-mangling a non-ASCII repo path at the parent->worker boundary — so the
+     * worker's own wide-argv read could never recover it (#423/#20). */
+    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
+    if (!wcmd) {
+        out->outcome = CBM_PROC_SPAWN_FAILED;
+        out->exit_code = -1;
+        out->term_signal = 0;
+        return -1;
+    }
 
     HANDLE hlog = INVALID_HANDLE_VALUE;
-    STARTUPINFOA si = {.cb = sizeof(si)};
+    STARTUPINFOW si = {.cb = sizeof(si)};
     if (opts->log_file) {
         hlog = CreateFileA(opts->log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -249,7 +263,8 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     }
 
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(wcmd);
     if (hlog != INVALID_HANDLE_VALUE) {
         CloseHandle(hlog);
     }

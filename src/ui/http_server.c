@@ -34,6 +34,7 @@
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 #include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
+#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -972,19 +973,30 @@ static void *index_thread_fn(void *arg) {
         atomic_store(&job->status, 3);
         return NULL;
     }
+    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
+     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
+     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
+    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
+    if (!wcmd) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
     HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOA si_proc = {.cb = sizeof(si_proc)};
+    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
     if (hlog != INVALID_HANDLE_VALUE) {
         si_proc.dwFlags = STARTF_USESTDHANDLES;
         si_proc.hStdError = hlog;
         si_proc.hStdOutput = hlog;
     }
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi)) {
+    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
+    free(wcmd);
+    if (!spawned) {
         snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
         atomic_store(&job->status, 3);
         if (hlog != INVALID_HANDLE_VALUE)

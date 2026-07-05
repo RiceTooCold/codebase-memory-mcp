@@ -127,8 +127,9 @@ jobs:
   # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
   # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
   # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
-  # and the UI directory picker not enumerating drives (#548, roots field). The
-  # still-open narrow-argv repro (#423/#20) is opt-in and excluded via -GuardsOnly.
+  # the UI directory picker not enumerating drives (#548, roots field), and non-ASCII
+  # CLI arguments being mangled by the narrow-argv main() (#423/#20, fixed by the
+  # wide-argv entrypoint that reads GetCommandLineW).
   test-windows-guards:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -155,9 +156,10 @@ jobs:
         # guard's HTTP UI is available. Functional gate only (no sanitizers).
         run: scripts/build.sh --with-ui CC=clang CXX=clang++
 
-      - name: Windows regression guards (#636/#357, #618, #548)
+      - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
         shell: pwsh
-        # -GuardsOnly runs the three green guards and gates on them; the runner
-        # runs indexing in-process (CBM_INDEX_SUPERVISOR=0) so a guard reflects the
-        # path/hook/drive fix under test, not the orthogonal index-worker spawn.
+        # -GuardsOnly runs the four green guards and gates on them. The runner sets
+        # CBM_INDEX_SUPERVISOR=0 for determinism, but the non-ASCII CLI guard drops that
+        # override so it exercises the real supervisor->worker spawn (where #423/#20's
+        # second half lives); the other guards test path/hook/drive fixes in-process.
         run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

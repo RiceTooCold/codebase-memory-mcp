@@ -16,19 +16,20 @@
                       * test_non_ascii_path.py    guards #636/#357 (fixed by #700)
                       * test_hook_augment.py      guards #618      (fixed by #619)
                       * test_ui_drive_listing.py  guards #548      (roots field)
+                      * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
 
       KNOWN REDS  - genuine, still-open Windows bugs reproduced at the product
                     surface. They are EXPECTED to be RED (exit 1) and are opt-in
                     (never gate CI). If one turns GREEN the underlying bug was
                     fixed and it should be promoted to a guard.
-                      * test_cli_non_ascii_arg.py reproduces #423/#20 (narrow
-                        argv main() - no wide command line)
+                      * (none currently - test_cli_non_ascii_arg.py was promoted to a
+                        guard when the wide-argv fix for #423/#20 landed)
 
-    Determinism: indexing runs in-process (CBM_INDEX_SUPERVISOR=0). These tests
-    exercise path / hook / drive handling, not the index-supervisor subprocess
-    path; the pass-level readers (#700's cbm_fopen routing) run in-process either
-    way, so the guard coverage is identical while results stay independent of the
-    local toolchain's worker-spawn behavior.
+    Determinism: the runner sets CBM_INDEX_SUPERVISOR=0 so the path / hook / drive
+    guards index in-process (the pass-level readers under test, e.g. #700's cbm_fopen
+    routing, run in-process either way). The non-ASCII CLI guard is the exception - it
+    drops that override to cross the real supervisor -> worker spawn, where the second
+    half of #423/#20 lives (CreateProcessW delivering the wide command line).
 
     On native Windows the MinGW/LLVM toolchain ships no libasan/libubsan, so the
     build disables sanitizers (SANITIZE=). Where the toolchain provides
@@ -104,13 +105,13 @@ $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_hook_augment.py",
-    "tests\windows\test_ui_drive_listing.py"
-)
-
-# Opt-in known-red repros - EXPECTED red (exit 1); never gate CI.
-$knownReds = @(
+    "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py"
 )
+
+# Opt-in known-red repros - EXPECTED red (exit 1); never gate CI. Currently empty:
+# test_cli_non_ascii_arg.py was promoted to a guard when #423/#20's wide-argv fix landed.
+$knownReds = @()
 
 $guardFailures = @()
 $guardSkips = @()
@@ -159,7 +160,7 @@ if ($fixedKeepers.Count -gt 0) {
 }
 if ($guardFailures.Count -gt 0) {
     Write-Host ("REGRESSION: {0} green guard(s) went red: {1}" -f $guardFailures.Count, ($guardFailures -join ", ")) -ForegroundColor Red
-    Write-Host "A previously-fixed Windows bug is broken again. See tests/windows/RED_TEST_ANALYSIS.md." -ForegroundColor Red
+    Write-Host "A previously-fixed Windows bug is broken again (see the guard's docstring and its referenced issue)." -ForegroundColor Red
     exit 1
 }
 Write-Host "All Windows green guards passed." -ForegroundColor Green

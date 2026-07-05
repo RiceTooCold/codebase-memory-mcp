@@ -1,23 +1,24 @@
-"""RED integration test — `cli index_repository` rejects a non-ASCII repo_path.
+"""GREEN regression guard — `cli index_repository` honors a non-ASCII repo_path.
 
-Reproduces the CLI-argv half of issue #636 / #423 / #20 on native Windows.
+Guards the CLI-argv fix for issue #636 / #423 / #20 on native Windows.
 
 The documented entrypoint `codebase-memory-mcp cli index_repository '<json>'`
-receives its JSON argument through argv. main() is declared as
-`int main(int argc, char **argv)` (src/main.c) — it does not use wmain /
-GetCommandLineW — so on Windows the C runtime hands it argv in the active ANSI
-code page. A repo_path containing non-ASCII characters is therefore mangled (or,
-when yyjson rejects the now-invalid UTF-8, the whole argument is discarded), and
-the command fails with "repo_path is required" / "Pipeline failed" instead of
-indexing the real directory.
+receives its JSON argument through argv. main() used to take only the narrow
+`int main(int argc, char **argv)` (src/main.c), so on Windows the C runtime handed
+it argv in the active ANSI code page: a repo_path containing non-ASCII characters
+was mangled (or, when yyjson rejected the now-invalid UTF-8, the whole argument was
+discarded), and the command failed with "repo_path is required" / "Pipeline failed"
+instead of indexing the real directory.
+
+Fixed: on Windows main() now rebuilds argv from the wide command line
+(GetCommandLineW + CommandLineToArgvW) and converts each element to UTF-8, so a
+non-ASCII repo path survives. This test asserts that fix stays in place — it was RED
+before it and is GREEN after. (It is inherently green on Linux/macOS, where argv is
+already UTF-8 bytes.)
 
 The directory itself is created with the Windows wide API (Python uses
 CreateFileW/_wmkdir under the hood), so it genuinely exists on disk; only the
-argv path delivery is lossy.
-
-Passes on Linux/macOS (argv is UTF-8 bytes). Fails on native Windows until the
-CLI reads the wide command line (GetCommandLineW + CommandLineToArgvW, or a
-wmain entrypoint) and converts to UTF-8.
+argv path delivery was lossy.
 
 Exit code: 0 == honored (green), 1 == rejected/mangled (red), 2 == setup error.
 
@@ -80,6 +81,13 @@ def main():
 
         env2 = dict(os.environ)
         env2["CBM_CACHE_DIR"] = cache
+        # Exercise the DEFAULT (supervisor-enabled) path, not in-process. The non-ASCII
+        # repo path must survive BOTH the argv read (main() wide command line) AND the
+        # supervisor -> worker spawn (CreateProcessW). The suite runner sets
+        # CBM_INDEX_SUPERVISOR=0 for determinism across the other guards; forcing it OFF
+        # here would run in-process and mask the spawn-boundary half of #423/#20, so we
+        # drop the override and let the supervisor wrap the worker as it does for users.
+        env2.pop("CBM_INDEX_SUPERVISOR", None)
         arg = json.dumps({"repo_path": repo}, ensure_ascii=False)
         p = subprocess.run([binary, "cli", "index_repository", arg],
                            capture_output=True, timeout=120, env=env2)
@@ -87,14 +95,15 @@ def main():
         err = (p.stderr or b"").decode("utf-8", "replace")
         honored = '"nodes"' in out and '"nodes":0' not in out.replace(" ", "")
         print("ASCII control: indexed OK")
-        print("non-ASCII argv: rc=%d" % p.returncode)
+        print("non-ASCII argv (supervised): rc=%d" % p.returncode)
         print("  stdout: %s" % out[:200].replace("\n", " "))
         print("  stderr: %s" % err[-200:].replace("\n", " "))
         if honored:
-            print("\nGREEN: CLI honored the non-ASCII repo_path.")
+            print("\nGREEN: CLI honored the non-ASCII repo_path (argv + worker spawn).")
             return 0
-        print("\nRED: CLI did not index the non-ASCII repo_path (argv delivered "
-              "in the ANSI code page; main() does not read the wide command line).")
+        print("\nRED: CLI did not index the non-ASCII repo_path — the path was mangled "
+              "either in the argv read (narrow main()) or re-mangled at the "
+              "supervisor->worker CreateProcess boundary (ANSI code page).")
         return 1
     finally:
         shutil.rmtree(work, ignore_errors=True)

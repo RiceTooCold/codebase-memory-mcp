@@ -40,6 +40,10 @@ enum {
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
+#include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
+#ifdef _WIN32
+#include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
+#endif
 #include "ui/config.h"
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -593,6 +597,48 @@ static void setup_signal_handlers(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* On Windows the CRT hands main() an argv encoded in the active ANSI code page, so a
+ * non-ASCII CLI argument (e.g. a repo path like café_日本語_repo) is mangled before the
+ * program ever sees it — the documented `cli index_repository "<json>"` then fails with
+ * "repo_path is required" (#423/#20). Rebuild argv from the wide command line
+ * (GetCommandLineW → CommandLineToArgvW) and convert each element to UTF-8 so the rest
+ * of the program receives the same UTF-8 bytes it gets on POSIX. Returns a
+ * NULL-terminated argv and sets *out_argc, or NULL on any failure (caller then keeps
+ * the original narrow argv). The returned block lives for the whole process (argv must
+ * stay valid until exit), so it is intentionally never freed. */
+static char **cbm_win_utf8_argv(int *out_argc) {
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) {
+        return NULL;
+    }
+    if (wargc <= 0) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    char **u8argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
+    if (!u8argv) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    for (int i = 0; i < wargc; i++) {
+        u8argv[i] = cbm_wide_to_utf8(wargv[i]);
+        if (!u8argv[i]) {
+            for (int j = 0; j < i; j++) {
+                free(u8argv[j]);
+            }
+            free(u8argv);
+            LocalFree(wargv);
+            return NULL;
+        }
+    }
+    LocalFree(wargv);
+    *out_argc = wargc;
+    return u8argv; /* NULL-terminated (calloc'd wargc+1) */
+}
+#endif /* _WIN32 */
+
 int main(int argc, char **argv) {
     /* Defense-in-depth: bind tree-sitter and sqlite3 to mimalloc so a
      * correct binary does not rely on the fragile MI_OVERRIDE symbol override
@@ -601,6 +647,20 @@ int main(int argc, char **argv) {
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+#ifdef _WIN32
+    /* Replace the ANSI-code-page argv the CRT handed us with a UTF-8 argv rebuilt from
+     * the wide command line, so non-ASCII CLI arguments survive (#423/#20). Falls back
+     * to the original argv if the wide rebuild fails. Done after cbm_alloc_init (which
+     * must stay the very first statement) but before argv is first read below. */
+    {
+        int win_argc = 0;
+        char **win_argv = cbm_win_utf8_argv(&win_argc);
+        if (win_argv) {
+            argc = win_argc;
+            argv = win_argv;
+        }
+    }
+#endif
     /* #845: mark this process as the REAL binary so the index supervisor may
      * wrap index_repository in a worker subprocess. Must run before any
      * subcommand dispatch so MCP-server, CLI, and HTTP paths are all covered.

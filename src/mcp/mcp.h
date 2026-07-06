@@ -2,7 +2,7 @@
  * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp.
  *
  * Implements JSON-RPC 2.0 over stdio with the MCP tool calling protocol.
- * Provides 14 graph analysis tools (search, trace, query, index, etc.)
+ * Provides 15 graph analysis tools (search, trace, query, index, etc.)
  */
 #ifndef CBM_MCP_H
 #define CBM_MCP_H
@@ -107,6 +107,26 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 
 /* Handle a tools/call request. Returns MCP tool result JSON. */
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
+
+/* ── Working-tree → HEAD line-range mapping (get_node_history) ── */
+
+/* Maps a line range through the hunks of a `git diff -U0 HEAD` stream so
+ * uncommitted edits above a symbol don't shift its history tracking onto
+ * the wrong lines. Feed each diff line to cbm_range_map_hunk (non-header
+ * lines are ignored), then call cbm_range_map_finish to apply the shift.
+ * Exposed for unit tests. */
+typedef struct {
+    int start; /* in: working-tree start line; out: HEAD start line */
+    int end;   /* in: working-tree end line;   out: HEAD end line */
+    int delta_start;
+    int delta_end;
+    bool modified; /* any hunk seen (file differs from HEAD) */
+    bool overlap;  /* a hunk intersects the range itself */
+} cbm_range_map_t;
+
+void cbm_range_map_init(cbm_range_map_t *m, int start, int end);
+void cbm_range_map_hunk(cbm_range_map_t *m, const char *diff_line);
+void cbm_range_map_finish(cbm_range_map_t *m);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 

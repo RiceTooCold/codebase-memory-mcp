@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 15 graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -4366,6 +4366,62 @@ static void nh_free_revs(nh_rev_t *revs, int count) {
  * bypassed: the mapping changes with every edit, not with HEAD), and
  * *overlap when a hunk intersects the range itself (the node's own body
  * has uncommitted edits — history is valid only up to HEAD). */
+void cbm_range_map_init(cbm_range_map_t *m, int start, int end) {
+    memset(m, 0, sizeof(*m));
+    m->start = start;
+    m->end = end;
+}
+
+void cbm_range_map_hunk(cbm_range_map_t *m, const char *diff_line) {
+    if (strncmp(diff_line, "@@ -", SLEN("@@ -")) != 0) {
+        return;
+    }
+    m->modified = true;
+    int old_len = SKIP_ONE;
+    int new_start = 0;
+    int new_len = SKIP_ONE;
+    const char *p = diff_line + SLEN("@@ -");
+    (void)strtol(p, (char **)&p, MCP_COL_10);
+    if (*p == ',') {
+        old_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    }
+    p = strchr(p, '+');
+    if (!p) {
+        return;
+    }
+    new_start = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    if (*p == ',') {
+        new_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    }
+
+    /* New-side extent of this hunk (pure deletions occupy no lines). */
+    int hunk_new_end = new_len > 0 ? new_start + new_len - SKIP_ONE : new_start;
+    int shift = new_len - old_len;
+
+    if (hunk_new_end < m->start) {
+        m->delta_start += shift;
+        m->delta_end += shift;
+    } else if (new_start <= m->end) {
+        m->overlap = true;
+        m->delta_end += shift; /* approximate: keep the range covering */
+    }
+    /* hunks fully below the range: no effect */
+}
+
+void cbm_range_map_finish(cbm_range_map_t *m) {
+    if (!m->modified) {
+        return;
+    }
+    m->start -= m->delta_start;
+    m->end -= m->delta_end;
+    if (m->start < SKIP_ONE) {
+        m->start = SKIP_ONE;
+    }
+    if (m->end < m->start) {
+        m->end = m->start;
+    }
+}
+
 static void nh_map_range_to_head(const char *root_path, const char *file_path, int *start, int *end,
                                  bool *modified, bool *overlap) {
     *modified = false;
@@ -4383,56 +4439,19 @@ static void nh_map_range_to_head(const char *root_path, const char *file_path, i
         return;
     }
 
-    int delta_start = 0;
-    int delta_end = 0;
+    cbm_range_map_t map;
+    cbm_range_map_init(&map, *start, *end);
     char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "@@ -", SLEN("@@ -")) != 0) {
-            continue;
-        }
-        *modified = true;
-        int old_len = SKIP_ONE;
-        int new_start = 0;
-        int new_len = SKIP_ONE;
-        const char *p = line + SLEN("@@ -");
-        (void)strtol(p, (char **)&p, MCP_COL_10);
-        if (*p == ',') {
-            old_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
-        }
-        p = strchr(p, '+');
-        if (!p) {
-            continue;
-        }
-        new_start = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
-        if (*p == ',') {
-            new_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
-        }
-
-        /* New-side extent of this hunk (pure deletions occupy no lines). */
-        int hunk_new_end = new_len > 0 ? new_start + new_len - SKIP_ONE : new_start;
-        int shift = new_len - old_len;
-
-        if (hunk_new_end < *start) {
-            delta_start += shift;
-            delta_end += shift;
-        } else if (new_start <= *end) {
-            *overlap = true;
-            delta_end += shift; /* approximate: keep the range covering */
-        }
-        /* hunks fully below the range: no effect */
+        cbm_range_map_hunk(&map, line);
     }
     cbm_pclose(fp);
 
-    if (*modified) {
-        *start -= delta_start;
-        *end -= delta_end;
-        if (*start < SKIP_ONE) {
-            *start = SKIP_ONE;
-        }
-        if (*end < *start) {
-            *end = *start;
-        }
-    }
+    cbm_range_map_finish(&map);
+    *start = map.start;
+    *end = map.end;
+    *modified = map.modified;
+    *overlap = map.overlap;
 }
 
 /* Read the repo's current HEAD sha into out (empty string on failure). */

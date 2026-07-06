@@ -3,7 +3,9 @@
  *
  * Implements the core of Extended RaBitQ (Gao et al., SIGMOD 2024/2025;
  * arXiv:2405.12497, arXiv:2409.09913) without the reference library (which is
- * C++ and bundles Eigen/MPL-2.0). Named rotsq, not rabitq: this is the
+ * C++ and bundles the Eigen linear-algebra dependency; nothing here is vendored
+ * or derived from it — this file is written from the papers). Named rotsq, not
+ * rabitq: this is the
  * FAMILY core (randomized rotation + per-vector scalar quantization + exact
  * code-expansion estimator), not the papers' exact codebook construction —
  * the name should not overclaim fidelity. Rotate each vector with a deterministic
@@ -34,10 +36,10 @@
 #include <stdint.h>
 
 enum {
-    CBM_RSQ_IN_DIM = 768,   /* input dimension (CBM_SEM_DIM) */
-    CBM_RSQ_DIM = 1024,     /* padded pow2 rotation dimension */
-    CBM_RSQ_BITS = 4,       /* bits per coordinate */
-    CBM_RSQ_LEVELS = 15,    /* (1 << CBM_RSQ_BITS) - 1 */
+    CBM_RSQ_IN_DIM = 768,                 /* input dimension (CBM_SEM_DIM) */
+    CBM_RSQ_DIM = 1024,                   /* padded pow2 rotation dimension */
+    CBM_RSQ_BITS = 4,                     /* bits per coordinate */
+    CBM_RSQ_LEVELS = 15,                  /* (1 << CBM_RSQ_BITS) - 1 */
     CBM_RSQ_CODE_BYTES = CBM_RSQ_DIM / 2, /* two 4-bit codes per byte */
 };
 

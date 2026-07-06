@@ -133,6 +133,13 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    sqlite3_stmt *stmt_ins_node_rev;
+    sqlite3_stmt *stmt_del_node_revs;
+    sqlite3_stmt *stmt_get_node_revs;
+    sqlite3_stmt *stmt_get_rev_meta;
+    sqlite3_stmt *stmt_upsert_rev_meta;
+    bool node_rev_schema_ready; /* lazy DDL guard for the two tables above */
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -775,6 +782,12 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_get_file_hashes);
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
+
+    finalize_stmt(&s->stmt_ins_node_rev);
+    finalize_stmt(&s->stmt_del_node_revs);
+    finalize_stmt(&s->stmt_get_node_revs);
+    finalize_stmt(&s->stmt_get_rev_meta);
+    finalize_stmt(&s->stmt_upsert_rev_meta);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -1651,6 +1664,193 @@ int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_file_hash");
         return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* ── Node revisions (per-node git timeline cache) ───────────────── */
+
+/* The tables are created lazily on first use (not in init_schema alone)
+ * because query-path opens (cbm_store_open_path_query) skip init_schema —
+ * this also upgrades pre-existing DBs in place. Idempotent, flag-guarded. */
+static int ensure_node_rev_schema(cbm_store_t *s) {
+    if (s->node_rev_schema_ready) {
+        return CBM_STORE_OK;
+    }
+    int rc = exec_sql(s, "CREATE TABLE IF NOT EXISTS node_revisions ("
+                         "  project TEXT NOT NULL,"
+                         "  qualified_name TEXT NOT NULL,"
+                         "  sha TEXT NOT NULL,"
+                         "  ts INTEGER NOT NULL DEFAULT 0,"
+                         "  author TEXT DEFAULT '',"
+                         "  subject TEXT DEFAULT '',"
+                         "  added INTEGER NOT NULL DEFAULT 0,"
+                         "  deleted INTEGER NOT NULL DEFAULT 0,"
+                         "  PRIMARY KEY (project, qualified_name, sha)"
+                         ");"
+                         "CREATE TABLE IF NOT EXISTS node_revision_meta ("
+                         "  project TEXT NOT NULL,"
+                         "  qualified_name TEXT NOT NULL,"
+                         "  head_sha TEXT NOT NULL,"
+                         "  PRIMARY KEY (project, qualified_name)"
+                         ");"
+                         "CREATE INDEX IF NOT EXISTS idx_noderev_sha "
+                         "ON node_revisions(project, sha);");
+    if (rc == CBM_STORE_OK) {
+        s->node_rev_schema_ready = true;
+    }
+    return rc;
+}
+
+int cbm_store_replace_node_revisions(cbm_store_t *s, const char *project, const char *qn,
+                                     const cbm_node_revision_t *revs, int count,
+                                     const char *head_sha) {
+    if (!s || !project || !qn || !head_sha) {
+        return CBM_STORE_ERR;
+    }
+    if (ensure_node_rev_schema(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "BEGIN IMMEDIATE;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *del =
+        prepare_cached(s, &s->stmt_del_node_revs,
+                       "DELETE FROM node_revisions WHERE project = ?1 AND qualified_name = ?2;");
+    if (!del) {
+        exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    bind_text(del, ST_COL_1, project);
+    bind_text(del, ST_COL_2, qn);
+    if (sqlite3_step(del) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_node_revisions");
+        exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *ins =
+        prepare_cached(s, &s->stmt_ins_node_rev,
+                       "INSERT OR REPLACE INTO node_revisions "
+                       "(project, qualified_name, sha, ts, author, subject, added, deleted) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);");
+    if (!ins) {
+        exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        sqlite3_reset(ins);
+        bind_text(ins, ST_COL_1, project);
+        bind_text(ins, ST_COL_2, qn);
+        bind_text(ins, ST_COL_3, safe_str(revs[i].sha));
+        sqlite3_bind_int64(ins, ST_COL_4, revs[i].ts);
+        bind_text(ins, ST_COL_5, safe_str(revs[i].author));
+        bind_text(ins, ST_COL_6, safe_str(revs[i].subject));
+        sqlite3_bind_int(ins, ST_COL_7, revs[i].added);
+        sqlite3_bind_int(ins, ST_COL_8, revs[i].deleted);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "insert_node_revision");
+            exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    }
+
+    sqlite3_stmt *meta =
+        prepare_cached(s, &s->stmt_upsert_rev_meta,
+                       "INSERT INTO node_revision_meta (project, qualified_name, head_sha) "
+                       "VALUES (?1, ?2, ?3) "
+                       "ON CONFLICT(project, qualified_name) DO UPDATE SET head_sha=?3;");
+    if (!meta) {
+        exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    bind_text(meta, ST_COL_1, project);
+    bind_text(meta, ST_COL_2, qn);
+    bind_text(meta, ST_COL_3, head_sha);
+    if (sqlite3_step(meta) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_node_revision_meta");
+        exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+
+    return exec_sql(s, "COMMIT;");
+}
+
+int cbm_store_get_node_revisions(cbm_store_t *s, const char *project, const char *qn,
+                                 cbm_node_revision_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (ensure_node_rev_schema(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_get_node_revs,
+                       "SELECT sha, ts, author, subject, added, deleted FROM node_revisions "
+                       "WHERE project = ?1 AND qualified_name = ?2 ORDER BY ts DESC;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, qn);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_revision_t *arr = malloc(cap * sizeof(cbm_node_revision_t));
+    if (!arr) {
+        return CBM_STORE_ERR;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, cap * sizeof(cbm_node_revision_t));
+        }
+        arr[n].sha = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].ts = sqlite3_column_int64(stmt, ST_COL_1);
+        arr[n].author = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+        arr[n].subject = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+        arr[n].added = sqlite3_column_int(stmt, ST_COL_4);
+        arr[n].deleted = sqlite3_column_int(stmt, ST_COL_5);
+        n++;
+    }
+
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_node_revisions(cbm_node_revision_t *revs, int count) {
+    if (!revs) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free((void *)revs[i].sha);
+        free((void *)revs[i].author);
+        free((void *)revs[i].subject);
+    }
+    free(revs);
+}
+
+int cbm_store_get_node_revision_head(cbm_store_t *s, const char *project, const char *qn,
+                                     char *out_sha, size_t cap) {
+    if (cap > 0) {
+        out_sha[0] = '\0';
+    }
+    if (ensure_node_rev_schema(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_get_rev_meta,
+                                        "SELECT head_sha FROM node_revision_meta "
+                                        "WHERE project = ?1 AND qualified_name = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, qn);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *sha = (const char *)sqlite3_column_text(stmt, 0);
+        snprintf(out_sha, cap, "%s", sha ? sha : "");
     }
     return CBM_STORE_OK;
 }

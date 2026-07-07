@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include <time.h> /* wide-flat linearity bound (extract_wide_flat_file_is_linear) */
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -2101,12 +2102,12 @@ TEST(python_calls) {
 }
 
 TEST(python_iris_classMethodValue) {
-    CBMFileResult *r = extract(
-        "import iris\n"
-        "iris_obj = iris.cls('%Library.ObjectScript')\n"
-        "def call_bfs(n):\n"
-        "    return iris_obj.classMethodValue('Graph.KG.TraversalBFS', 'BFSFastJson', n)\n",
-        CBM_LANG_PYTHON, "t", "store.py");
+    CBMFileResult *r =
+        extract("import iris\n"
+                "iris_obj = iris.cls('%Library.ObjectScript')\n"
+                "def call_bfs(n):\n"
+                "    return iris_obj.classMethodValue('Graph.KG.TraversalBFS', 'BFSFastJson', n)\n",
+                CBM_LANG_PYTHON, "t", "store.py");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call(r, "Graph.KG.TraversalBFS.BFSFastJson"));
@@ -3092,7 +3093,7 @@ TEST(complexity_go_method_receiver_self_recursion) {
     ASSERT_FALSE(r->has_error);
     const CBMDefinition *d = find_def(r, "save");
     ASSERT_NOT_NULL(d);
-    ASSERT_TRUE(d->is_recursive); /* s.save() == receiver s → self */
+    ASSERT_TRUE(d->is_recursive);         /* s.save() == receiver s → self */
     ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
     cbm_free_result(r);
 
@@ -3355,15 +3356,14 @@ TEST(walk_defs_no_truncation_over_4096_issue668) {
  * otherwise file-path-based (cbm_is_test_file), so test fns in a regular .rs
  * file leak. (#855) */
 TEST(extract_rust_test_attr_marks_is_test_issue855) {
-    CBMFileResult *r = extract(
-        "pub fn real_fn() {}\n"
-        "\n"
-        "#[test]\n"
-        "fn sync_test() {}\n"
-        "\n"
-        "#[tokio::test]\n"
-        "async fn async_test() {}\n",
-        CBM_LANG_RUST, "t", "src/lib.rs");
+    CBMFileResult *r = extract("pub fn real_fn() {}\n"
+                               "\n"
+                               "#[test]\n"
+                               "fn sync_test() {}\n"
+                               "\n"
+                               "#[tokio::test]\n"
+                               "async fn async_test() {}\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
@@ -3390,9 +3390,64 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     PASS();
 }
 
+/* Reproduce-first (ms-typescript reallyLargeFile.ts, 2026-07-07): a file
+ * whose root node has hundreds of thousands of FLAT SIBLINGS (580k ////
+ * comment lines in the 3.5 MB fourslash fixture) hung extraction for over
+ * 15 minutes: walk_defs pushed children via index-based ts_node_child(i),
+ * which is O(i) per call in tree-sitter — O(n^2) per wide node (~1.7e11
+ * iterator steps on the real file; 100% of stack samples inside
+ * ts_node_child_iterator_next). The supervisor then killed the silent
+ * worker as a hang and, via the stale extraction marker, quarantined
+ * INNOCENT files on every retry.
+ *
+ * This fixture is an 80k-sibling flat file: quadratic child access needs
+ * minutes under ASan; the linear TSTreeCursor collection finishes in
+ * milliseconds. The 30 s bound has ~100x headroom over the fixed cost —
+ * RED on index-based child pushes, GREEN on the cursor walk. The def-count
+ * guard keeps the test honest: extraction must actually process the whole
+ * breadth, not skip it. */
+TEST(extract_wide_flat_file_is_linear) {
+    /* Mirror the monster's exact shape: its 580k wide siblings are COMMENT
+     * nodes, not defs, so this fixture isolates the WALK cost. A def-heavy
+     * fixture (400k var statements) additionally hits a separate per-def
+     * sibling-scan cost in extraction (O(defs x siblings), tracked as its own
+     * finding) and took 647s even with the walk fixed — it guarded the wrong
+     * thing. Sparse real defs keep the anti-vacuous breadth check. */
+    const int n = 400 * 1000;                         /* comment siblings */
+    const size_t cap = (size_t)n * 24 + (size_t)8192; /* "// wide filler 399999\n" = 22 chars */
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "// wide filler %d\n", i);
+        if (i % 4000 == 0) {
+            off += (size_t)snprintf(src + off, cap - off, "var wide_a%d = %d;\n", i, i);
+        }
+    }
+    time_t start = time(NULL);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)off, CBM_LANG_JAVASCRIPT, "proj", "wide.js", 0, NULL, NULL);
+    long elapsed_s = (long)(time(NULL) - start);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    /* Anti-vacuous guard: the breadth was actually walked. */
+    ASSERT_GTE(r->defs.count, 100);
+    cbm_free_result(r);
+    if (elapsed_s >= 30) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "wide-flat extract took %lds (>=30s bound) — quadratic child access", elapsed_s);
+        FAIL(msg);
+    }
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    /* Wide-flat-file linearity (ms-typescript hang) */
+    RUN_TEST(extract_wide_flat_file_is_linear);
 
     /* Perl call-graph noise (#459 follow-up) */
     RUN_TEST(extract_perl_config_string_not_a_callee);

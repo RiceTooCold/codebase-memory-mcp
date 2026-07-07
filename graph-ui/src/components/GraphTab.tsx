@@ -8,6 +8,12 @@ import {
   GRAPH_NODE_BUDGET_MAX,
 } from "../hooks/useGraphData";
 import { GraphLoader } from "./GraphLoader";
+import { DisplaySettingsMenu } from "./DisplaySettingsMenu";
+import {
+  loadDisplaySettings,
+  saveDisplaySettings,
+  type DisplaySettings,
+} from "../lib/density";
 import {
   GraphScene,
   computeCameraTarget,
@@ -65,6 +71,13 @@ export function GraphTab({ project }: GraphTabProps) {
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
   const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
   const [showLabels, setShowLabels] = useState(true);
+  const [display, setDisplay] = useState<DisplaySettings>(() =>
+    loadDisplaySettings(),
+  );
+  const updateDisplay = useCallback((next: DisplaySettings) => {
+    setDisplay(next);
+    saveDisplaySettings(next);
+  }, []);
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
   const limitNotice = formatGraphLimitNotice(data);
@@ -375,6 +388,7 @@ export function GraphTab({ project }: GraphTabProps) {
                 highlightedIds={highlightedIds}
                 cameraTarget={cameraTarget}
                 showLabels={showLabels}
+                display={display}
                 onNodeClick={handleNodeClick}
               />
             </ErrorBoundary>
@@ -440,6 +454,7 @@ export function GraphTab({ project }: GraphTabProps) {
                   title="How many nodes to load (5,000 steps, edges between loaded nodes follow automatically)"
                 />
               </div>
+              <DisplaySettingsMenu settings={display} onChange={updateDisplay} />
               <Button
                 variant="outline"
                 size="sm"

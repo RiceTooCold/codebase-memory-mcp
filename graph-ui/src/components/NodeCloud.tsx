@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import type { GraphNode } from "../lib/types";
+import { nodeGlowBoost } from "../lib/density";
 
 interface NodeCloudProps {
   nodes: GraphNode[];
@@ -9,6 +10,9 @@ interface NodeCloudProps {
   onHover: (node: GraphNode | null) => void;
   onClick: (node: GraphNode) => void;
   opacity?: number;
+  /* Multiplier on the per-node glow boost. 1 = full boost (sparse graphs),
+   * 0 = flat colors (dense graphs). Adaptive default × user setting. */
+  boost?: number;
 }
 
 /* Above this count instanced spheres stop paying off (vertex + matrix cost)
@@ -27,6 +31,7 @@ function nodeColor(
   node: GraphNode,
   highlightedIds: Set<number> | null,
   opacity: number,
+  boost: number,
   tempColor: THREE.Color,
 ): [number, number, number] {
   const hasHighlight = highlightedIds && highlightedIds.size > 0;
@@ -34,11 +39,13 @@ function nodeColor(
   if (hasHighlight && !highlightedIds.has(node.id)) {
     tempColor.multiplyScalar(0.15);
   } else {
-    /* Boost above 1.0 so bloom picks up the excess as glow corona.
-     * Hotter stars (white/blue) get a stronger boost = brighter halo. */
-    const brightness = (tempColor.r + tempColor.g + tempColor.b) / 3;
-    const boost = 1.2 + brightness * 0.8; /* 1.2x for red, 2.0x for white */
-    tempColor.multiplyScalar(boost);
+    /* Boost above 1.0 so bloom picks up the excess as glow corona. Blue hubs
+     * glow most, red leaves modestly, white/yellow least (see nodeGlowBoost).
+     * The boost amount also fades toward 1.0 (flat color) as density rises so
+     * dense graphs stay legible instead of blooming into a white blob. */
+    const fullBoost = nodeGlowBoost(tempColor.r, tempColor.g, tempColor.b);
+    const applied = 1 + (fullBoost - 1) * boost;
+    tempColor.multiplyScalar(applied);
   }
   return [tempColor.r * opacity, tempColor.g * opacity, tempColor.b * opacity];
 }
@@ -73,6 +80,7 @@ function NodePoints({
   onHover,
   onClick,
   opacity,
+  boost,
 }: Required<NodeCloudProps>) {
   const { raycaster } = useThree();
 
@@ -94,13 +102,13 @@ function NodePoints({
       positions[i * 3] = n.x;
       positions[i * 3 + 1] = n.y;
       positions[i * 3 + 2] = n.z;
-      const [r, g, b] = nodeColor(n, highlightedIds, opacity, tempColor);
+      const [r, g, b] = nodeColor(n, highlightedIds, opacity, boost, tempColor);
       colors[i * 3] = r;
       colors[i * 3 + 1] = g;
       colors[i * 3 + 2] = b;
     }
     return { positions, colors };
-  }, [nodes, highlightedIds, opacity]);
+  }, [nodes, highlightedIds, opacity, boost]);
 
   return (
     <points
@@ -145,6 +153,7 @@ function NodeSpheres({
   onHover,
   onClick,
   opacity,
+  boost,
 }: Required<NodeCloudProps>) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const tempObj = useMemo(() => new THREE.Object3D(), []);
@@ -155,13 +164,19 @@ function NodeSpheres({
   const colors = useMemo(() => {
     const arr = new Float32Array(nodes.length * 3);
     for (let i = 0; i < nodes.length; i++) {
-      const [r, g, b] = nodeColor(nodes[i], highlightedIds, opacity, tempColor);
+      const [r, g, b] = nodeColor(
+        nodes[i],
+        highlightedIds,
+        opacity,
+        boost,
+        tempColor,
+      );
       arr[i * 3] = r;
       arr[i * 3 + 1] = g;
       arr[i * 3 + 2] = b;
     }
     return arr;
-  }, [nodes, highlightedIds, tempColor, opacity]);
+  }, [nodes, highlightedIds, tempColor, opacity, boost]);
 
   /* Node positions are static (the layout is server-computed), so instance
    * matrices only change with the node set or the highlight — never rebuild
@@ -221,6 +236,7 @@ export function NodeCloud({
   onHover,
   onClick,
   opacity = 1.0,
+  boost = 1.0,
 }: NodeCloudProps) {
   if (nodes.length > POINT_MODE_THRESHOLD) {
     return (
@@ -230,6 +246,7 @@ export function NodeCloud({
         onHover={onHover}
         onClick={onClick}
         opacity={opacity}
+        boost={boost}
       />
     );
   }
@@ -240,6 +257,7 @@ export function NodeCloud({
       onHover={onHover}
       onClick={onClick}
       opacity={opacity}
+      boost={boost}
     />
   );
 }

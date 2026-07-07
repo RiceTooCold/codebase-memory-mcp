@@ -27,6 +27,10 @@ src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validat
 src/mcp/mcp.c:cbm_popen:detect_changes via git diff (args validated)
 src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validated)
 src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
+src/mcp/mcp.c:cbm_popen:get_node_history git log -L timeline (root+file validated via validate_search_path_arg)
+src/mcp/mcp.c:cbm_popen:get_node_history git rev-parse HEAD (root validated)
+src/mcp/mcp.c:cbm_popen:get_node_history git diff -U0 range mapping (root+file validated)
+src/mcp/mcp.c:cbm_popen:get_node_history git show co-change (shas from git output, root validated)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
 # ── Pipeline: git history parsing (fallback when libgit2 not available) ────

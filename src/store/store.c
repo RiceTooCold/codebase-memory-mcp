@@ -131,6 +131,7 @@ struct cbm_store {
 
     sqlite3_stmt *stmt_upsert_file_hash;
     sqlite3_stmt *stmt_get_file_hashes;
+    sqlite3_stmt *stmt_get_file_hash;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
 
@@ -780,6 +781,7 @@ void cbm_store_close(cbm_store_t *s) {
 
     finalize_stmt(&s->stmt_upsert_file_hash);
     finalize_stmt(&s->stmt_get_file_hashes);
+    finalize_stmt(&s->stmt_get_file_hash);
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
 
@@ -1651,6 +1653,24 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
     return CBM_STORE_OK;
 }
 
+int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
+                            int64_t *mtime_ns, int64_t *size) {
+    sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_get_file_hash,
+                                        "SELECT mtime_ns, size FROM file_hashes "
+                                        "WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, CBM_SZ_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    *mtime_ns = sqlite3_column_int64(stmt, 0);
+    *size = sqlite3_column_int64(stmt, SKIP_ONE);
+    return CBM_STORE_OK;
+}
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_file_hash,
@@ -1678,7 +1698,7 @@ static int ensure_node_rev_schema(cbm_store_t *s) {
         return CBM_STORE_OK;
     }
     int rc = exec_sql(s, "CREATE TABLE IF NOT EXISTS node_revisions ("
-                         "  project TEXT NOT NULL,"
+                         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
                          "  qualified_name TEXT NOT NULL,"
                          "  sha TEXT NOT NULL,"
                          "  ts INTEGER NOT NULL DEFAULT 0,"
@@ -1689,13 +1709,11 @@ static int ensure_node_rev_schema(cbm_store_t *s) {
                          "  PRIMARY KEY (project, qualified_name, sha)"
                          ");"
                          "CREATE TABLE IF NOT EXISTS node_revision_meta ("
-                         "  project TEXT NOT NULL,"
+                         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
                          "  qualified_name TEXT NOT NULL,"
                          "  head_sha TEXT NOT NULL,"
                          "  PRIMARY KEY (project, qualified_name)"
-                         ");"
-                         "CREATE INDEX IF NOT EXISTS idx_noderev_sha "
-                         "ON node_revisions(project, sha);");
+                         ");");
     if (rc == CBM_STORE_OK) {
         s->node_rev_schema_ready = true;
     }
@@ -1787,7 +1805,7 @@ int cbm_store_get_node_revisions(cbm_store_t *s, const char *project, const char
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_node_revs,
                        "SELECT sha, ts, author, subject, added, deleted FROM node_revisions "
-                       "WHERE project = ?1 AND qualified_name = ?2 ORDER BY ts DESC;");
+                       "WHERE project = ?1 AND qualified_name = ?2 ORDER BY ts DESC, sha;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }

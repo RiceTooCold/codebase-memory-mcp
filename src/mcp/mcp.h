@@ -120,8 +120,10 @@ typedef struct {
     int end;   /* in: working-tree end line;   out: HEAD end line */
     int delta_start;
     int delta_end;
-    bool modified; /* any hunk seen (file differs from HEAD) */
-    bool overlap;  /* a hunk intersects the range itself */
+    bool modified;    /* any hunk seen (file differs from HEAD) */
+    bool overlap;     /* a hunk intersects the range itself */
+    bool uncommitted; /* the whole range sits inside a pure-insertion hunk:
+                         the symbol does not exist at HEAD (no history) */
 } cbm_range_map_t;
 
 void cbm_range_map_init(cbm_range_map_t *m, int start, int end);

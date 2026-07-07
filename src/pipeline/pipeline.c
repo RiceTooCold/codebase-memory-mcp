@@ -757,17 +757,6 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     return CBM_NOT_FOUND;
 }
 
-/* Get platform-specific mtime in nanoseconds. */
-static int64_t stat_mtime_ns(const struct stat *fst) {
-#ifdef __APPLE__
-    return ((int64_t)fst->st_mtimespec.tv_sec * PL_NSEC_PER_SEC) +
-           (int64_t)fst->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)fst->st_mtime * 1000000000LL;
-#else
-    return ((int64_t)fst->st_mtim.tv_sec * PL_NSEC_PER_SEC) + (int64_t)fst->st_mtim.tv_nsec;
-#endif
-}
 
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
@@ -803,7 +792,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             struct stat fst;
             if (stat(files[i].path, &fst) == 0) {
                 cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                           stat_mtime_ns(&fst), fst.st_size);
+                                           cbm_stat_mtime_ns(&fst), fst.st_size);
             }
         }
 

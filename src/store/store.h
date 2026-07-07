@@ -400,6 +400,11 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
 
+/* Single-file hash lookup (staleness checks). Returns CBM_STORE_OK,
+ * CBM_STORE_NOT_FOUND when the file has no hash row, or CBM_STORE_ERR. */
+int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
+                            int64_t *mtime_ns, int64_t *size);
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 
 int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);

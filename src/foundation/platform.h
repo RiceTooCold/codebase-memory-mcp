@@ -14,6 +14,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+
+/* ── Platform-portable mtime_ns ───────────────────────────────── */
+
+/* Nanosecond mtime from a stat buffer (second-granularity on Windows). */
+static inline int64_t cbm_stat_mtime_ns(const struct stat *st) {
+    enum { CBM_STAT_NS_PER_SEC = 1000000000 };
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * CBM_STAT_NS_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * CBM_STAT_NS_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * CBM_STAT_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
 
 /* ── Safe memory ──────────────────────────────────────────────── */
 

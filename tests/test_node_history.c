@@ -35,6 +35,7 @@ TEST(noderev_head_empty_when_uncached) {
 
 TEST(noderev_replace_get_roundtrip) {
     cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "p", "/tmp/p");
     cbm_node_revision_t in[2] = {
         {"aaaa1111", 1000, "alice", "feat: birth", 10, 0},
         {"bbbb2222", 2000, "bob", "fix: guard", 2, 1},
@@ -64,6 +65,7 @@ TEST(noderev_replace_get_roundtrip) {
 
 TEST(noderev_replace_overwrites_previous) {
     cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "p", "/tmp/p");
     cbm_node_revision_t v1[2] = {
         {"aaaa1111", 1000, "alice", "one", 1, 0},
         {"bbbb2222", 2000, "bob", "two", 1, 0},
@@ -89,6 +91,7 @@ TEST(noderev_replace_overwrites_previous) {
 
 TEST(noderev_empty_replace_caches_no_history) {
     cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "p", "/tmp/p");
     /* A node with zero history still gets a cache-validity marker. */
     ASSERT_EQ(cbm_store_replace_node_revisions(s, "p", "p.f.fn", NULL, 0, "headsha"), CBM_STORE_OK);
     cbm_node_revision_t *out = NULL;
@@ -105,6 +108,8 @@ TEST(noderev_empty_replace_caches_no_history) {
 
 TEST(noderev_isolated_per_node_and_project) {
     cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "p1", "/tmp/p1");
+    cbm_store_upsert_project(s, "p2", "/tmp/p2");
     cbm_node_revision_t a[1] = {{"aaaa1111", 1000, "alice", "a", 1, 0}};
     cbm_node_revision_t b[1] = {{"bbbb2222", 2000, "bob", "b", 1, 0}};
     ASSERT_EQ(cbm_store_replace_node_revisions(s, "p1", "p1.f.fn", a, 1, "h1"), CBM_STORE_OK);
@@ -238,6 +243,36 @@ TEST(rangemap_start_clamped_to_one) {
     PASS();
 }
 
+TEST(rangemap_pure_insertion_covering_range_is_uncommitted) {
+    cbm_range_map_t m;
+    /* Brand-new 50-line function appended at working-tree lines 500-549
+     * of a file whose HEAD version ends at line 400: one insertion hunk
+     * swallows the whole range — the symbol has no lines at HEAD. */
+    cbm_range_map_init(&m, 500, 549);
+    cbm_range_map_hunk(&m, "@@ -400,0 +401,150 @@ tail\n");
+    cbm_range_map_finish(&m);
+    ASSERT_EQ(m.uncommitted, true);
+    ASSERT_EQ(m.overlap, true);
+    PASS();
+}
+
+TEST(rangemap_partial_overlap_is_not_uncommitted) {
+    cbm_range_map_t m;
+    /* Edit hunk (old lines exist) overlapping the range: committed symbol
+     * with uncommitted edits — history at HEAD still exists. */
+    cbm_range_map_init(&m, 100, 120);
+    cbm_range_map_hunk(&m, "@@ -110,3 +110,6 @@ body\n");
+    cbm_range_map_finish(&m);
+    ASSERT_EQ(m.overlap, true);
+    ASSERT_EQ(m.uncommitted, false);
+    /* Insertion inside the range but not covering it: same. */
+    cbm_range_map_init(&m, 100, 120);
+    cbm_range_map_hunk(&m, "@@ -109,0 +110,5 @@ body\n");
+    cbm_range_map_finish(&m);
+    ASSERT_EQ(m.uncommitted, false);
+    PASS();
+}
+
 SUITE(node_history) {
     RUN_TEST(noderev_get_on_fresh_store_is_empty);
     RUN_TEST(noderev_head_empty_when_uncached);
@@ -254,4 +289,6 @@ SUITE(node_history) {
     RUN_TEST(rangemap_single_line_hunk_omits_count);
     RUN_TEST(rangemap_ignores_non_hunk_lines);
     RUN_TEST(rangemap_start_clamped_to_one);
+    RUN_TEST(rangemap_pure_insertion_covering_range_is_uncommitted);
+    RUN_TEST(rangemap_partial_overlap_is_not_uncommitted);
 }

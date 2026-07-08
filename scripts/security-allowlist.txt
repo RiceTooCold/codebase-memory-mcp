@@ -9,6 +9,9 @@ src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
 src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
 src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
+src/foundation/compat_fs.c:fork:cbm_proc_open — deadline-bounded command reader (kills runaway children)
+src/foundation/compat_fs.c:execl:cbm_proc_open — sh -c in own process group so timeouts can kill the whole tree
+src/foundation/compat_fs.c:_popen:cbm_proc_open Windows fallback (no deadline; documented follow-up)
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
@@ -27,10 +30,10 @@ src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validat
 src/mcp/mcp.c:cbm_popen:detect_changes via git diff (args validated)
 src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validated)
 src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
-src/mcp/mcp.c:cbm_popen:get_node_history git log -L timeline (root+file validated via validate_search_path_arg)
-src/mcp/mcp.c:cbm_popen:get_node_history git rev-parse HEAD (root validated)
-src/mcp/mcp.c:cbm_popen:get_node_history git diff -U0 range mapping (root+file validated)
-src/mcp/mcp.c:cbm_popen:get_node_history git show co-change (shas from git output, root validated)
+src/mcp/mcp.c:cbm_proc_open:get_node_history git log -L timeline (root+file validated, since/until charset-validated, 30s deadline)
+src/mcp/mcp.c:cbm_proc_open:get_node_history git rev-parse HEAD + shallow probe (root validated, 10s deadline)
+src/mcp/mcp.c:cbm_proc_open:get_node_history git diff -U0 range mapping (root+file validated, 10s deadline)
+src/mcp/mcp.c:cbm_proc_open:get_node_history git show co-change (shas from git output, root validated, 10s deadline)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
 # ── Pipeline: git history parsing (fallback when libgit2 not available) ────

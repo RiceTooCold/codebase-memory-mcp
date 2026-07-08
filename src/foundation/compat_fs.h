@@ -39,6 +39,42 @@ void cbm_closedir(cbm_dir_t *d);
 FILE *cbm_popen(const char *cmd, const char *mode);
 int cbm_pclose(FILE *f);
 
+/* ── Deadline-bounded command reader ──────────────────────────── */
+
+/* popen("r")-like handle whose reads observe a wall-clock deadline, so a
+ * runaway subprocess (e.g. an expensive git history walk) cannot hang the
+ * caller. POSIX: pipe + fork of `sh -c cmd` in its own process group —
+ * on expiry the group is killed and close() never blocks. Windows: plain
+ * _popen with no deadline enforcement (documented follow-up); timed_out
+ * stays false. */
+enum { CBM_PROC_BUF = 4096 };
+
+typedef struct {
+#ifdef _WIN32
+    FILE *fp;
+#else
+    int fd;
+    int pid;
+    long long deadline_ms; /* CLOCK_MONOTONIC, ms; 0 = no deadline */
+    size_t buf_len;
+    bool eof;
+    char buf[CBM_PROC_BUF];
+#endif
+    bool timed_out;
+} cbm_proc_t;
+
+/* Start `sh -c cmd` with stdout piped to the handle. timeout_ms <= 0
+ * means no deadline. Returns false when the process could not start. */
+bool cbm_proc_open(cbm_proc_t *p, const char *cmd, int timeout_ms);
+
+/* Read the next line (newline kept, fgets-style: at most cap-1 bytes).
+ * Returns false on EOF or deadline expiry — check p->timed_out. */
+bool cbm_proc_gets(cbm_proc_t *p, char *out, size_t cap);
+
+/* Reap the child. Returns its exit code, or -1 when it was killed on
+ * timeout, did not exit normally, or could not be reaped. */
+int cbm_proc_close(cbm_proc_t *p);
+
 /* ── File operations ──────────────────────────────────────────── */
 
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */

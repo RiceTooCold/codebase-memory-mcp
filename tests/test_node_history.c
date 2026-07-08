@@ -6,6 +6,8 @@
 #include "test_framework.h"
 #include <store/store.h>
 #include <mcp/mcp.h>
+#include <foundation/compat_fs.h>
+#include <foundation/constants.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -273,6 +275,85 @@ TEST(rangemap_partial_overlap_is_not_uncommitted) {
     PASS();
 }
 
+/* ── since/until shell-safety validation ─────────────────────── */
+
+TEST(gitdate_accepts_common_forms) {
+    ASSERT_TRUE(cbm_nh_valid_git_date("2026-01-01"));
+    ASSERT_TRUE(cbm_nh_valid_git_date("6 months ago"));
+    ASSERT_TRUE(cbm_nh_valid_git_date("2026-01-01T00:00:00+08:00"));
+    ASSERT_TRUE(cbm_nh_valid_git_date("1.week.ago"));
+    ASSERT_TRUE(cbm_nh_valid_git_date("2026/01/01"));
+    PASS();
+}
+
+TEST(gitdate_rejects_shell_metacharacters) {
+    ASSERT_FALSE(cbm_nh_valid_git_date(NULL));
+    ASSERT_FALSE(cbm_nh_valid_git_date(""));
+    ASSERT_FALSE(cbm_nh_valid_git_date("'; rm -rf ~"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("$(reboot)"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("`id`"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("a;b"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("a|b"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("a>b"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("it's"));
+    ASSERT_FALSE(cbm_nh_valid_git_date("2026-01-01 12:00 \"quoted\""));
+    /* over the 64-char cap */
+    ASSERT_FALSE(cbm_nh_valid_git_date("0123456789012345678901234567890123456789"
+                                       "0123456789012345678901234"));
+    PASS();
+}
+
+/* ── Deadline-bounded command reader (POSIX-only assertions) ─── */
+
+TEST(proc_reads_lines_then_exit_status) {
+#ifndef _WIN32
+    cbm_proc_t p;
+    ASSERT_TRUE(cbm_proc_open(&p, "printf 'one\\ntwo\\n'; exit 7", 5000));
+    char line[CBM_SZ_64];
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "one\n");
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "two\n");
+    ASSERT_FALSE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_FALSE(p.timed_out);
+    ASSERT_EQ(cbm_proc_close(&p), 7);
+#endif
+    PASS();
+}
+
+TEST(proc_long_line_split_fgets_style) {
+#ifndef _WIN32
+    cbm_proc_t p;
+    ASSERT_TRUE(cbm_proc_open(&p, "printf 'abcdef\\n'", 5000));
+    char line[4]; /* cap-1 = 3 payload bytes per read */
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "abc");
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "def");
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "\n");
+    ASSERT_FALSE(cbm_proc_gets(&p, line, sizeof(line)));
+    cbm_proc_close(&p);
+#endif
+    PASS();
+}
+
+TEST(proc_deadline_kills_stalled_child) {
+#ifndef _WIN32
+    cbm_proc_t p;
+    /* Child emits one line then stalls well past the 200ms deadline. */
+    ASSERT_TRUE(cbm_proc_open(&p, "printf 'first\\n'; sleep 30", 200));
+    char line[CBM_SZ_64];
+    ASSERT_TRUE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_STR_EQ(line, "first\n");
+    ASSERT_FALSE(cbm_proc_gets(&p, line, sizeof(line)));
+    ASSERT_TRUE(p.timed_out);
+    /* close must kill the child and return promptly, not wait 30s. */
+    ASSERT_EQ(cbm_proc_close(&p), -1);
+#endif
+    PASS();
+}
+
 SUITE(node_history) {
     RUN_TEST(noderev_get_on_fresh_store_is_empty);
     RUN_TEST(noderev_head_empty_when_uncached);
@@ -291,4 +372,9 @@ SUITE(node_history) {
     RUN_TEST(rangemap_start_clamped_to_one);
     RUN_TEST(rangemap_pure_insertion_covering_range_is_uncommitted);
     RUN_TEST(rangemap_partial_overlap_is_not_uncommitted);
+    RUN_TEST(gitdate_accepts_common_forms);
+    RUN_TEST(gitdate_rejects_shell_metacharacters);
+    RUN_TEST(proc_reads_lines_then_exit_status);
+    RUN_TEST(proc_long_line_split_fgets_style);
+    RUN_TEST(proc_deadline_kills_stalled_child);
 }

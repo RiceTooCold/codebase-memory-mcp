@@ -130,6 +130,10 @@ void cbm_range_map_init(cbm_range_map_t *m, int start, int end);
 void cbm_range_map_hunk(cbm_range_map_t *m, const char *diff_line);
 void cbm_range_map_finish(cbm_range_map_t *m);
 
+/* Validate a user-supplied git date for safe embedding in a quoted shell
+ * command (since/until args of get_node_history). Exposed for unit tests. */
+bool cbm_nh_valid_git_date(const char *s);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.

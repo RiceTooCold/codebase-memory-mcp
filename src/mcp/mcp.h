@@ -134,6 +134,11 @@ void cbm_range_map_finish(cbm_range_map_t *m);
  * command (since/until args of get_node_history). Exposed for unit tests. */
 bool cbm_nh_valid_git_date(const char *s);
 
+/* True when a git-reported repo-relative path names the node's
+ * index-relative file (suffix match with '/' boundary — the indexed root
+ * may sit below the git root). Exposed for unit tests. */
+bool cbm_nh_same_file(const char *git_path, const char *node_file);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.

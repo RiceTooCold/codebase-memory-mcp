@@ -303,6 +303,17 @@ TEST(gitdate_rejects_shell_metacharacters) {
     PASS();
 }
 
+TEST(cochange_self_filter_handles_subdir_index_root) {
+    /* git show reports repo-relative paths; the node's path is relative
+     * to the indexed root, which may be a subdir of the git root. */
+    ASSERT_TRUE(cbm_nh_same_file("lib/a.ts", "lib/a.ts"));
+    ASSERT_TRUE(cbm_nh_same_file("src/lib/a.ts", "lib/a.ts"));
+    ASSERT_FALSE(cbm_nh_same_file("mylib/a.ts", "lib/a.ts")); /* boundary */
+    ASSERT_FALSE(cbm_nh_same_file("lib/b.ts", "lib/a.ts"));
+    ASSERT_FALSE(cbm_nh_same_file("a.ts", "lib/a.ts"));
+    PASS();
+}
+
 /* ── Deadline-bounded command reader (POSIX-only assertions) ─── */
 
 TEST(proc_reads_lines_then_exit_status) {
@@ -374,6 +385,7 @@ SUITE(node_history) {
     RUN_TEST(rangemap_partial_overlap_is_not_uncommitted);
     RUN_TEST(gitdate_accepts_common_forms);
     RUN_TEST(gitdate_rejects_shell_metacharacters);
+    RUN_TEST(cochange_self_filter_handles_subdir_index_root);
     RUN_TEST(proc_reads_lines_then_exit_status);
     RUN_TEST(proc_long_line_split_fgets_style);
     RUN_TEST(proc_deadline_kills_stalled_child);

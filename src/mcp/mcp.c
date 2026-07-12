@@ -4231,6 +4231,19 @@ bool cbm_nh_valid_git_date(const char *s) {
     return true;
 }
 
+/* True when a git-reported repo-relative path names the node's file.
+ * The indexed root may sit below the git root ("src/" of a monorepo), so
+ * node_file ("lib/a.ts") can be a proper path suffix of the git path
+ * ("src/lib/a.ts") — require a '/' boundary so "mylib/a.ts" won't match. */
+bool cbm_nh_same_file(const char *git_path, const char *node_file) {
+    size_t gl = strlen(git_path);
+    size_t nl = strlen(node_file);
+    if (gl < nl || strcmp(git_path + (gl - nl), node_file) != 0) {
+        return false;
+    }
+    return gl == nl || git_path[gl - nl - SKIP_ONE] == '/';
+}
+
 /* One parsed revision. patch is heap-allocated only when capturing diffs. */
 typedef struct {
     char sha[NH_SHA_BUF];
@@ -4623,7 +4636,7 @@ static void nh_add_co_changed(yyjson_mut_doc *doc, yyjson_mut_val *arr, const ch
         if (len == 0 || strncmp(line, "@@C@@", SLEN("@@C@@")) == 0) {
             continue;
         }
-        if (strcmp(line, node_file) == 0) {
+        if (cbm_nh_same_file(line, node_file)) {
             continue;
         }
         int idx = -1;

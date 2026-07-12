@@ -130,6 +130,24 @@ int cbm_pclose(FILE *f) {
     return _pclose(f);
 }
 
+/* Windows: no deadline enforcement — _popen exposes no process handle to
+ * kill, and the callers' git commands are already bounded by --max-count.
+ * Proper CreateProcess-based timeouts are a documented follow-up. */
+bool cbm_proc_open(cbm_proc_t *p, const char *cmd, int timeout_ms) {
+    (void)timeout_ms;
+    p->timed_out = false;
+    p->fp = _popen(cmd, "r");
+    return p->fp != NULL;
+}
+
+bool cbm_proc_gets(cbm_proc_t *p, char *out, size_t cap) {
+    return fgets(out, (int)cap, p->fp) != NULL;
+}
+
+int cbm_proc_close(cbm_proc_t *p) {
+    return _pclose(p->fp);
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
     wchar_t *wpath = cbm_utf8_to_wide(path);
@@ -194,8 +212,11 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #include <dirent.h>
 #include <errno.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 struct cbm_dir {
@@ -260,6 +281,136 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
 
 int cbm_pclose(FILE *f) {
     return pclose(f);
+}
+
+enum { CBM_MS_PER_SEC = 1000, CBM_NS_PER_MS = 1000000, CBM_PROC_EXEC_FAIL = 127 };
+
+static long long proc_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * CBM_MS_PER_SEC + ts.tv_nsec / CBM_NS_PER_MS;
+}
+
+bool cbm_proc_open(cbm_proc_t *p, const char *cmd, int timeout_ms) {
+    memset(p, 0, sizeof(*p));
+    p->fd = -1;
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+    if (pid == 0) {
+        /* Own process group so a timeout can kill the shell AND whatever
+         * it spawned (git), not just the shell. */
+        setpgid(0, 0);
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(CBM_PROC_EXEC_FAIL);
+    }
+    close(fds[1]);
+    setpgid(pid, pid); /* mirror the child's call so a kill can never race it */
+    p->fd = fds[0];
+    p->pid = (int)pid;
+    p->deadline_ms = timeout_ms > 0 ? proc_now_ms() + timeout_ms : 0;
+    return true;
+}
+
+/* Emit up to cap-1 buffered bytes ending at the first newline (or the
+ * whole buffer when force is set / it is cap-filling). fgets semantics. */
+static bool proc_emit(cbm_proc_t *p, char *out, size_t cap, bool force) {
+    size_t take = 0;
+    while (take < p->buf_len && p->buf[take] != '\n') {
+        take++;
+    }
+    if (take < p->buf_len) {
+        take++; /* include the newline */
+    } else if (!force && p->buf_len < cap - SKIP_ONE) {
+        return false; /* no full line buffered yet */
+    }
+    if (take == 0) {
+        return false;
+    }
+    if (take > cap - SKIP_ONE) {
+        take = cap - SKIP_ONE;
+    }
+    memcpy(out, p->buf, take);
+    out[take] = '\0';
+    p->buf_len -= take;
+    memmove(p->buf, p->buf + take, p->buf_len);
+    return true;
+}
+
+bool cbm_proc_gets(cbm_proc_t *p, char *out, size_t cap) {
+    if (cap < PAIR_LEN || p->timed_out) {
+        return false;
+    }
+    for (;;) {
+        if (proc_emit(p, out, cap, p->eof || p->buf_len == sizeof(p->buf))) {
+            return true;
+        }
+        if (p->eof) {
+            return false;
+        }
+        int wait_ms = -1;
+        if (p->deadline_ms > 0) {
+            long long remaining = p->deadline_ms - proc_now_ms();
+            if (remaining <= 0) {
+                p->timed_out = true;
+                return false;
+            }
+            wait_ms = (int)remaining;
+        }
+        struct pollfd pfd = {.fd = p->fd, .events = POLLIN};
+        int prc = poll(&pfd, 1, wait_ms);
+        if (prc == 0) {
+            p->timed_out = true;
+            return false;
+        }
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            p->eof = true;
+            continue;
+        }
+        ssize_t got = read(p->fd, p->buf + p->buf_len, sizeof(p->buf) - p->buf_len);
+        if (got > 0) {
+            p->buf_len += (size_t)got;
+        } else if (got == 0 || errno != EINTR) {
+            p->eof = true;
+        }
+    }
+}
+
+int cbm_proc_close(cbm_proc_t *p) {
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+    if (p->pid <= 0) {
+        return -1;
+    }
+    if (p->timed_out && kill(-(pid_t)p->pid, SIGKILL) != 0) {
+        kill((pid_t)p->pid, SIGKILL);
+    }
+    int status = 0;
+    pid_t rc;
+    do {
+        rc = waitpid((pid_t)p->pid, &status, 0);
+    } while (rc < 0 && errno == EINTR);
+    p->pid = 0;
+    if (p->timed_out || rc < 0 || !WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status);
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {

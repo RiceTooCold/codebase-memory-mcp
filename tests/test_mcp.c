@@ -167,12 +167,13 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all 15 tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
+    ASSERT_NOT_NULL(strstr(json, "get_node_history"));
     ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));

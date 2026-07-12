@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 159 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, and C++ — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 159 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, and C++ — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **15 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -139,6 +139,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Architecture Decision Records**: `manage_adr` persists architectural decisions across sessions
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
+- **Per-symbol git timeline**: `get_node_history` returns every commit that touched a symbol's line range — lazily computed, cached until HEAD moves, with on-demand diffs and temporal co-change coupling
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Dead code detection**: Finds functions with zero callers, excluding entry points
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
@@ -324,7 +325,7 @@ Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 14 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
 
 </details>
 
@@ -389,6 +390,7 @@ codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.result
 | `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
 | `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
+| `get_node_history` | Git evolution timeline of a symbol: every commit that touched its line range (author, date, line stats), lazily computed and cached. Options: embedded diffs, temporal co-change coupling. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
@@ -527,7 +529,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)

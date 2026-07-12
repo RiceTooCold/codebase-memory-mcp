@@ -61,6 +61,37 @@ typedef struct {
     int64_t size;
 } cbm_file_hash_t;
 
+/* One commit that touched a node's line range (sparse timeline entry).
+ * Metadata only — patch text is never stored; it is regenerated on demand
+ * from git, which is already a content-addressed store of every version. */
+typedef struct {
+    const char *sha;    /* full commit hash */
+    int64_t ts;         /* author timestamp (unix epoch) */
+    const char *author; /* author name */
+    const char *subject;
+    int added;   /* lines added to the tracked range in this commit */
+    int deleted; /* lines deleted from the tracked range in this commit */
+} cbm_node_revision_t;
+
+/* Replace the cached timeline of one node atomically (delete + insert +
+ * meta upsert in a transaction). head_sha records the repo HEAD the
+ * timeline was computed at — the cache-validity key. */
+int cbm_store_replace_node_revisions(cbm_store_t *s, const char *project, const char *qn,
+                                     const cbm_node_revision_t *revs, int count,
+                                     const char *head_sha);
+
+/* Load the cached timeline of one node, newest first. Caller frees via
+ * cbm_store_free_node_revisions. */
+int cbm_store_get_node_revisions(cbm_store_t *s, const char *project, const char *qn,
+                                 cbm_node_revision_t **out, int *count);
+
+void cbm_store_free_node_revisions(cbm_node_revision_t *revs, int count);
+
+/* Fetch the HEAD sha a node's cached timeline was computed at into out_sha.
+ * Returns CBM_STORE_OK with out_sha[0]=='\0' when no cache entry exists. */
+int cbm_store_get_node_revision_head(cbm_store_t *s, const char *project, const char *qn,
+                                     char *out_sha, size_t cap);
+
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
                                          int start_line, int end_line, cbm_node_t **out,
@@ -368,6 +399,11 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
+
+/* Single-file hash lookup (staleness checks). Returns CBM_STORE_OK,
+ * CBM_STORE_NOT_FOUND when the file has no hash row, or CBM_STORE_ERR. */
+int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
+                            int64_t *mtime_ns, int64_t *size);
 
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 

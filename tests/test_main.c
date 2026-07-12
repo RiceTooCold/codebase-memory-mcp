@@ -65,6 +65,7 @@ extern void suite_store_arch(void);
 extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
+extern void suite_node_history(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
@@ -120,6 +121,7 @@ int main(void) {
     RUN_SUITE(store_bulk);
     RUN_SUITE(store_pragmas);
     RUN_SUITE(store_checkpoint);
+    RUN_SUITE(node_history);
 
     /* Cypher (M6) */
     RUN_SUITE(cypher);

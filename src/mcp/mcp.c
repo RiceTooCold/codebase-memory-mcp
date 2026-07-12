@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 15 graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -68,6 +68,7 @@ enum {
 #include <yyjson/yyjson.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -432,6 +433,36 @@ static const tool_def_t TOOLS[] = {
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or date to compare from (e.g. HEAD~5, v0.5.0, 2026-01-01)\"}},\"required\":"
      "[\"project\"]}"},
+
+    {"get_node_history",
+     "Get the git evolution timeline of a symbol (function/class/method): every commit that "
+     "touched its line range, newest first, with author, date, subject and per-commit line "
+     "stats. Use INSTEAD OF raw git log when you need provenance ('why does this code look "
+     "like this', 'when was this guard added', 'has this been reverted before') — the timeline "
+     "is scoped to the symbol, not the whole file, so it fits in context. Computed lazily via "
+     "git line-range tracking on first call, then cached in the graph DB until HEAD moves. "
+     "Options: include_patch returns the actual diffs of the most recent revisions (regenerated "
+     "from git on demand, never stored); co_changed returns files that most often changed in "
+     "the same commits as this symbol — hidden coupling that static edges miss; since/until "
+     "bound the walk to a time window (cheaper on large repos; windowed results bypass the "
+     "cache). The response sets shallow:true when the repo is a shallow clone — the timeline "
+     "is then truncated by clone depth, not real history. "
+     "IMPORTANT: First call search_graph to find the exact qualified_name, then pass it here.",
+     "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\","
+     "\"description\":\"Full qualified_name from search_graph, or short symbol name "
+     "(suggestions returned if ambiguous)\"},\"project\":{\"type\":\"string\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":20,\"description\":\"Max revisions in the "
+     "response (full count always reported in total_revisions)\"},"
+     "\"include_patch\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Embed the "
+     "diff of the newest patch_limit revisions\"},"
+     "\"patch_limit\":{\"type\":\"integer\",\"default\":3,\"description\":\"How many revision "
+     "diffs to embed when include_patch is true\"},"
+     "\"co_changed\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Also return "
+     "files that repeatedly changed in the same commits as this symbol (temporal coupling)\"},"
+     "\"since\":{\"type\":\"string\",\"description\":\"Only revisions after this git date "
+     "(e.g. \\\"2026-01-01\\\", \\\"6 months ago\\\")\"},"
+     "\"until\":{\"type\":\"string\",\"description\":\"Only revisions up to this git date\"}},"
+     "\"required\":[\"qualified_name\",\"project\"]}"},
 
     {"manage_adr", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
@@ -4165,6 +4196,846 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── get_node_history ─────────────────────────────────────────── */
+
+enum {
+    NH_DEFAULT_LIMIT = 20,
+    NH_DEFAULT_PATCH_LIMIT = 3,
+    NH_PATCH_CAP = 8192,    /* max embedded patch bytes per revision */
+    NH_MAX_REVS = 512,      /* hard cap on parsed revisions */
+    NH_COCHANGE_SHAS = 12,  /* commits sampled for co-change */
+    NH_COCHANGE_FILES = 64, /* distinct co-changed files tracked */
+    NH_COCHANGE_TOP = 10,   /* co-changed files returned */
+    NH_SHA_BUF = 48,
+    NH_DATE_BUF = 24,
+    NH_US = 0x1f, /* ASCII unit separator used in the git format string */
+    NH_ARG_MAX = 64,                 /* max length of a since/until value */
+    NH_GIT_LOG_TIMEOUT_MS = 30000,   /* deadline for the -L history walk */
+    NH_GIT_FAST_TIMEOUT_MS = 10000,  /* deadline for cheap git commands */
+    NH_GIT_ERR = -1,                 /* git failed and nothing was parsed */
+    NH_GIT_TIMEOUT = -2,             /* the walk hit its deadline */
+};
+
+/* Validate a user-supplied git date ("2026-01-01", "3 months ago") for
+ * safe embedding in a quoted shell command: conservative allowlist with
+ * no quoting, expansion, or redirection characters. */
+bool cbm_nh_valid_git_date(const char *s) {
+    if (!s || !*s || strlen(s) > NH_ARG_MAX) {
+        return false;
+    }
+    for (const char *p = s; *p; p++) {
+        if (!isalnum((unsigned char)*p) && !strchr(" .:+-/T", *p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* True when a git-reported repo-relative path names the node's file.
+ * The indexed root may sit below the git root ("src/" of a monorepo), so
+ * node_file ("lib/a.ts") can be a proper path suffix of the git path
+ * ("src/lib/a.ts") — require a '/' boundary so "mylib/a.ts" won't match. */
+bool cbm_nh_same_file(const char *git_path, const char *node_file) {
+    size_t gl = strlen(git_path);
+    size_t nl = strlen(node_file);
+    if (gl < nl || strcmp(git_path + (gl - nl), node_file) != 0) {
+        return false;
+    }
+    return gl == nl || git_path[gl - nl - SKIP_ONE] == '/';
+}
+
+/* One parsed revision. patch is heap-allocated only when capturing diffs. */
+typedef struct {
+    char sha[NH_SHA_BUF];
+    int64_t ts;
+    char author[CBM_SZ_256];
+    char subject[CBM_SZ_512];
+    int added;
+    int deleted;
+    char *patch;
+    size_t patch_len;
+    bool patch_truncated;
+} nh_rev_t;
+
+/* Split a "@@C@@<sha>\x1f<ts>\x1f<author>\x1f<subject>" line into rev. */
+static bool nh_parse_commit_line(const char *line, nh_rev_t *rev) {
+    memset(rev, 0, sizeof(*rev));
+    const char *p = line + SLEN("@@C@@");
+    const char *sep1 = strchr(p, NH_US);
+    if (!sep1) {
+        return false;
+    }
+    size_t sha_len = (size_t)(sep1 - p);
+    if (sha_len >= sizeof(rev->sha)) {
+        sha_len = sizeof(rev->sha) - SKIP_ONE;
+    }
+    memcpy(rev->sha, p, sha_len);
+    rev->sha[sha_len] = '\0';
+
+    const char *sep2 = strchr(sep1 + SKIP_ONE, NH_US);
+    if (!sep2) {
+        return false;
+    }
+    rev->ts = strtoll(sep1 + SKIP_ONE, NULL, MCP_COL_10);
+
+    const char *sep3 = strchr(sep2 + SKIP_ONE, NH_US);
+    if (!sep3) {
+        return false;
+    }
+    size_t alen = (size_t)(sep3 - (sep2 + SKIP_ONE));
+    if (alen >= sizeof(rev->author)) {
+        alen = sizeof(rev->author) - SKIP_ONE;
+    }
+    memcpy(rev->author, sep2 + SKIP_ONE, alen);
+    rev->author[alen] = '\0';
+
+    snprintf(rev->subject, sizeof(rev->subject), "%s", sep3 + SKIP_ONE);
+    size_t slen = strlen(rev->subject);
+    while (slen > 0 &&
+           (rev->subject[slen - SKIP_ONE] == '\n' || rev->subject[slen - SKIP_ONE] == '\r')) {
+        rev->subject[--slen] = '\0';
+    }
+    return true;
+}
+
+static void nh_free_revs(nh_rev_t *revs, int count);
+
+/* Append a line to rev->patch, growing it up to NH_PATCH_CAP. */
+static void nh_append_patch(nh_rev_t *rev, const char *line) {
+    if (rev->patch_truncated) {
+        return;
+    }
+    size_t add = strlen(line);
+    if (rev->patch_len + add >= NH_PATCH_CAP) {
+        rev->patch_truncated = true;
+        return;
+    }
+    char *grown = realloc(rev->patch, rev->patch_len + add + SKIP_ONE);
+    if (!grown) {
+        return;
+    }
+    rev->patch = grown;
+    memcpy(rev->patch + rev->patch_len, line, add + SKIP_ONE);
+    rev->patch_len += add;
+}
+
+/* Options for one history walk. since/until are pre-validated git dates
+ * (cbm_nh_valid_git_date) or NULL; timed_out reports a deadline expiry. */
+typedef struct {
+    bool want_patch; /* capture diff text for the first patch_limit revisions */
+    int patch_limit;
+    int max_count; /* walk bound — pass NH_MAX_REVS for the full timeline */
+    const char *since;
+    const char *until;
+    bool timed_out;
+} nh_log_opts_t;
+
+/* Run `git log -L<start>,<end>:<file>` and parse the commit stream.
+ * Returns revision count, NH_GIT_ERR when git failed and nothing was
+ * parsed, or NH_GIT_TIMEOUT when the walk hit its deadline. */
+static int nh_run_git_log(const char *root_path, const char *file_path, int start_line,
+                          int end_line, nh_log_opts_t *opts, nh_rev_t **out) {
+    char window[CBM_SZ_256] = "";
+    int woff = 0;
+#ifdef _WIN32
+    const char *win_fmt[] = {" \"--since=%s\"", " \"--until=%s\""};
+#else
+    const char *win_fmt[] = {" '--since=%s'", " '--until=%s'"};
+#endif
+    if (opts->since) {
+        woff += snprintf(window + woff, sizeof(window) - (size_t)woff, win_fmt[0], opts->since);
+    }
+    if (opts->until && woff >= 0 && woff < (int)sizeof(window)) {
+        snprintf(window + woff, sizeof(window) - (size_t)woff, win_fmt[SKIP_ONE], opts->until);
+    }
+
+    char cmd[CBM_SZ_2K];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" log \"-L%d,%d:%s\" --max-count=%d%s "
+             "\"--format=@@C@@%%H%%x1f%%at%%x1f%%an%%x1f%%s\" 2>NUL",
+             root_path, start_line, end_line, file_path, opts->max_count, window);
+#else
+    snprintf(cmd, sizeof(cmd),
+             "git -C '%s' log '-L%d,%d:%s' --max-count=%d%s "
+             "'--format=@@C@@%%H%%x1f%%at%%x1f%%an%%x1f%%s' 2>/dev/null",
+             root_path, start_line, end_line, file_path, opts->max_count, window);
+#endif
+
+    cbm_proc_t proc;
+    if (!cbm_proc_open(&proc, cmd, NH_GIT_LOG_TIMEOUT_MS)) {
+        return NH_GIT_ERR;
+    }
+
+    nh_rev_t *revs = calloc(NH_MAX_REVS, sizeof(nh_rev_t));
+    if (!revs) {
+        cbm_proc_close(&proc);
+        return NH_GIT_ERR;
+    }
+    bool want_patch = opts->want_patch;
+    int patch_limit = opts->patch_limit;
+    int n = 0;
+    nh_rev_t *cur = NULL;
+    bool in_hunk = false;
+    char line[CBM_SZ_4K];
+
+    while (cbm_proc_gets(&proc, line, sizeof(line))) {
+        if (strncmp(line, "@@C@@", SLEN("@@C@@")) == 0) {
+            if (n >= NH_MAX_REVS) {
+                break;
+            }
+            if (nh_parse_commit_line(line, &revs[n])) {
+                cur = &revs[n];
+                n++;
+            } else {
+                cur = NULL;
+            }
+            in_hunk = false;
+            continue;
+        }
+        if (!cur) {
+            continue;
+        }
+        /* Track hunk boundaries so +/- counting never mistakes content
+         * lines like "--i;" or "-- SQL comment" (rendered "---…"/"+++…")
+         * for the file headers that precede the first "@@" of a diff. */
+        if (strncmp(line, "diff ", SLEN("diff ")) == 0) {
+            in_hunk = false;
+        } else if (strncmp(line, "@@", SLEN("@@")) == 0) {
+            in_hunk = true;
+        } else if (in_hunk) {
+            if (line[0] == '+') {
+                cur->added++;
+            } else if (line[0] == '-') {
+                cur->deleted++;
+            }
+        }
+        if (want_patch && (cur - revs) < patch_limit) {
+            nh_append_patch(cur, line);
+        }
+    }
+    int status = cbm_proc_close(&proc);
+    if (proc.timed_out) {
+        /* A partial timeline would silently misrepresent the history —
+         * refuse it and let the caller suggest a bounded query. */
+        nh_free_revs(revs, n);
+        opts->timed_out = true;
+        return NH_GIT_TIMEOUT;
+    }
+    if (n == 0 && status != 0) {
+        free(revs);
+        return NH_GIT_ERR;
+    }
+    *out = revs;
+    return n;
+}
+
+static void nh_free_revs(nh_rev_t *revs, int count) {
+    if (!revs) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(revs[i].patch);
+    }
+    free(revs);
+}
+
+/* Map a working-tree line range to HEAD coordinates.
+ *
+ * The index stores line numbers of the file as it sits on disk, but
+ * `git log -L` anchors the range at HEAD — so uncommitted edits above a
+ * node silently shift every later node's history onto the wrong lines
+ * (the drift problem Sourcegraph solves with nearest-snapshot diff
+ * adjustment). Parse `git diff -U0 HEAD -- <file>` hunk headers and
+ * subtract the cumulative new-minus-old delta of hunks above the range.
+ *
+ * Sets *modified when the file differs from HEAD at all (cache must be
+ * bypassed: the mapping changes with every edit, not with HEAD), and
+ * *overlap when a hunk intersects the range itself (the node's own body
+ * has uncommitted edits — history is valid only up to HEAD). */
+void cbm_range_map_init(cbm_range_map_t *m, int start, int end) {
+    memset(m, 0, sizeof(*m));
+    m->start = start;
+    m->end = end;
+}
+
+void cbm_range_map_hunk(cbm_range_map_t *m, const char *diff_line) {
+    if (strncmp(diff_line, "@@ -", SLEN("@@ -")) != 0) {
+        return;
+    }
+    m->modified = true;
+    int old_len = SKIP_ONE;
+    int new_start = 0;
+    int new_len = SKIP_ONE;
+    const char *p = diff_line + SLEN("@@ -");
+    (void)strtol(p, (char **)&p, MCP_COL_10);
+    if (*p == ',') {
+        old_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    }
+    p = strchr(p, '+');
+    if (!p) {
+        return;
+    }
+    new_start = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    if (*p == ',') {
+        new_len = (int)strtol(p + SKIP_ONE, (char **)&p, MCP_COL_10);
+    }
+
+    /* New-side extent of this hunk (pure deletions occupy no lines). */
+    int hunk_new_end = new_len > 0 ? new_start + new_len - SKIP_ONE : new_start;
+    int shift = new_len - old_len;
+
+    if (hunk_new_end < m->start) {
+        m->delta_start += shift;
+        m->delta_end += shift;
+    } else if (new_start <= m->end) {
+        m->overlap = true;
+        m->delta_end += shift; /* approximate: keep the range covering */
+        if (old_len == 0 && new_start <= m->start && hunk_new_end >= m->end) {
+            /* Pure insertion swallowing the whole range: the symbol has no
+             * lines at HEAD, so there is no history to track (and a mapped
+             * start could point past HEAD's EOF, making git log -L fail). */
+            m->uncommitted = true;
+        }
+    }
+    /* hunks fully below the range: no effect */
+}
+
+void cbm_range_map_finish(cbm_range_map_t *m) {
+    if (!m->modified) {
+        return;
+    }
+    m->start -= m->delta_start;
+    m->end -= m->delta_end;
+    if (m->start < SKIP_ONE) {
+        m->start = SKIP_ONE;
+    }
+    if (m->end < m->start) {
+        m->end = m->start;
+    }
+}
+
+/* Returns false when the diff hit its deadline — the mapping is then
+ * unknown and the caller must not serve possibly-misanchored history. */
+static bool nh_map_range_to_head(const char *root_path, const char *file_path, int *start,
+                                 int *end, bool *modified, bool *overlap, bool *uncommitted) {
+    *modified = false;
+    *overlap = false;
+    *uncommitted = false;
+
+    char cmd[CBM_SZ_2K];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" diff -U0 HEAD -- \"%s\" 2>NUL", root_path, file_path);
+#else
+    snprintf(cmd, sizeof(cmd), "git -C '%s' diff -U0 HEAD -- '%s' 2>/dev/null", root_path,
+             file_path);
+#endif
+    cbm_proc_t proc;
+    if (!cbm_proc_open(&proc, cmd, NH_GIT_FAST_TIMEOUT_MS)) {
+        return true; /* same as the old popen-failure path: assume clean */
+    }
+
+    cbm_range_map_t map;
+    cbm_range_map_init(&map, *start, *end);
+    char line[CBM_SZ_1K];
+    while (cbm_proc_gets(&proc, line, sizeof(line))) {
+        cbm_range_map_hunk(&map, line);
+    }
+    cbm_proc_close(&proc);
+    if (proc.timed_out) {
+        return false;
+    }
+
+    cbm_range_map_finish(&map);
+    *start = map.start;
+    *end = map.end;
+    *modified = map.modified;
+    *overlap = map.overlap;
+    *uncommitted = map.uncommitted;
+    return true;
+}
+
+/* Read the repo's current HEAD sha into out (empty string on failure)
+ * and whether the repo is a shallow clone — one rev-parse invocation
+ * prints both, in argument order. */
+static void nh_git_head(const char *root_path, char *out, size_t cap, bool *shallow) {
+    out[0] = '\0';
+    *shallow = false;
+    char cmd[CBM_SZ_1K];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD --is-shallow-repository 2>NUL",
+             root_path);
+#else
+    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD --is-shallow-repository 2>/dev/null",
+             root_path);
+#endif
+    cbm_proc_t proc;
+    if (!cbm_proc_open(&proc, cmd, NH_GIT_FAST_TIMEOUT_MS)) {
+        return;
+    }
+    if (cbm_proc_gets(&proc, out, cap)) {
+        size_t len = strlen(out);
+        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
+            out[--len] = '\0';
+        }
+        char flag[CBM_SZ_16];
+        if (cbm_proc_gets(&proc, flag, sizeof(flag))) {
+            *shallow = strncmp(flag, "true", SLEN("true")) == 0;
+        }
+    }
+    cbm_proc_close(&proc);
+    if (proc.timed_out) {
+        out[0] = '\0';
+    }
+}
+
+/* Temporal coupling: count files co-occurring with node_file across the
+ * node's commits. Emits the top files as {file, co_changes} into arr. */
+static void nh_add_co_changed(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *root_path,
+                              const char *node_file, const char *const *shas, int nsha) {
+    if (nsha == 0) {
+        return;
+    }
+
+    char cmd[CBM_SZ_4K];
+    /* Format must contain a '%' placeholder or git treats it as a pretty
+     * preset name and dies with "invalid --pretty format". */
+#ifdef _WIN32
+    const char *prefix_fmt = "git -C \"%s\" show --name-only \"--format=@@C@@%%H\" ";
+    const char *devnull = "2>NUL";
+#else
+    const char *prefix_fmt = "git -C '%s' show --name-only '--format=@@C@@%%H' ";
+    const char *devnull = "2>/dev/null";
+#endif
+    int off = snprintf(cmd, sizeof(cmd), prefix_fmt, root_path);
+    if (off < 0 || off >= (int)sizeof(cmd)) {
+        return; /* root_path too long for a well-formed command */
+    }
+    for (int i = 0; i < nsha && off < (int)sizeof(cmd) - NH_SHA_BUF - CBM_SZ_16; i++) {
+        off += snprintf(cmd + off, sizeof(cmd) - off, "%s ", shas[i]);
+    }
+    snprintf(cmd + off, sizeof(cmd) - off, "%s", devnull);
+
+    cbm_proc_t proc;
+    if (!cbm_proc_open(&proc, cmd, NH_GIT_FAST_TIMEOUT_MS)) {
+        return;
+    }
+
+    char files[NH_COCHANGE_FILES][CBM_SZ_512];
+    int counts[NH_COCHANGE_FILES] = {0};
+    int nfiles = 0;
+
+    char line[CBM_SZ_1K];
+    /* On timeout the loop just ends: co-change degrades to a partial (or
+     * empty) list rather than failing the whole history response. */
+    while (cbm_proc_gets(&proc, line, sizeof(line))) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0 || strncmp(line, "@@C@@", SLEN("@@C@@")) == 0) {
+            continue;
+        }
+        if (cbm_nh_same_file(line, node_file)) {
+            continue;
+        }
+        int idx = -1;
+        for (int i = 0; i < nfiles; i++) {
+            if (strcmp(files[i], line) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 && nfiles < NH_COCHANGE_FILES) {
+            idx = nfiles++;
+            snprintf(files[idx], sizeof(files[idx]), "%s", line);
+        }
+        if (idx >= 0) {
+            counts[idx]++;
+        }
+    }
+    cbm_proc_close(&proc);
+
+    /* Emit the top entries by count (selection over a small fixed array). */
+    for (int rank = 0; rank < NH_COCHANGE_TOP; rank++) {
+        int best = -1;
+        for (int i = 0; i < nfiles; i++) {
+            if (counts[i] > 0 && (best < 0 || counts[i] > counts[best])) {
+                best = i;
+            }
+        }
+        if (best < 0 || counts[best] < MCP_RETURN_2) {
+            break; /* require >=2 co-occurrences to call it coupling */
+        }
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "file", files[best]);
+        yyjson_mut_obj_add_int(doc, item, "co_changes", counts[best]);
+        yyjson_mut_arr_add_val(arr, item);
+        counts[best] = 0;
+    }
+}
+
+/* Append one revision object to arr. patch may be NULL. */
+static void nh_emit_rev(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *sha, int64_t ts,
+                        const char *author, const char *subject, int added, int deleted,
+                        const char *patch, bool patch_truncated) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, item, "sha", sha);
+    char date[NH_DATE_BUF] = "";
+    time_t tt = (time_t)ts;
+    struct tm tmv;
+    if (cbm_gmtime_r(&tt, &tmv) != NULL) {
+        strftime(date, sizeof(date), "%Y-%m-%d", &tmv);
+    }
+    yyjson_mut_obj_add_strcpy(doc, item, "date", date);
+    yyjson_mut_obj_add_strcpy(doc, item, "author", author);
+    yyjson_mut_obj_add_strcpy(doc, item, "subject", subject);
+    yyjson_mut_obj_add_int(doc, item, "added", added);
+    yyjson_mut_obj_add_int(doc, item, "deleted", deleted);
+    if (patch) {
+        yyjson_mut_obj_add_strcpy(doc, item, "patch", patch);
+        if (patch_truncated) {
+            yyjson_mut_obj_add_bool(doc, item, "patch_truncated", true);
+        }
+    }
+    yyjson_mut_arr_add_val(arr, item);
+}
+
+static char *handle_get_node_history(cbm_mcp_server_t *srv, const char *args) {
+    char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    int limit = cbm_mcp_get_int_arg(args, "limit", NH_DEFAULT_LIMIT);
+    bool include_patch = cbm_mcp_get_bool_arg(args, "include_patch");
+    int patch_limit = cbm_mcp_get_int_arg(args, "patch_limit", NH_DEFAULT_PATCH_LIMIT);
+    bool co_changed = cbm_mcp_get_bool_arg(args, "co_changed");
+
+    if (!qn) {
+        free(project);
+        return cbm_mcp_text_result("qualified_name is required", true);
+    }
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *err = build_project_list_error("project not found or not indexed");
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
+        free(qn);
+        free(project);
+        return res;
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(qn);
+        free(project);
+        return not_indexed;
+    }
+    const char *effective_project = project ? project : srv->current_project;
+
+    /* Resolve the node: exact QN, then suffix (same tiers as get_code_snippet). */
+    cbm_node_t node = {0};
+    bool resolved = false;
+    if (cbm_store_find_node_by_qn(store, effective_project, qn, &node) == CBM_STORE_OK) {
+        resolved = true;
+    } else {
+        cbm_node_t *suffix_nodes = NULL;
+        int suffix_count = 0;
+        cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes,
+                                          &suffix_count);
+        if (suffix_count == SKIP_ONE) {
+            copy_node(&suffix_nodes[0], &node);
+            resolved = true;
+        } else if (suffix_count > SKIP_ONE) {
+            char *result = snippet_suggestions(qn, suffix_nodes, suffix_count);
+            cbm_store_free_nodes(suffix_nodes, suffix_count);
+            free(qn);
+            free(project);
+            return result;
+        }
+        cbm_store_free_nodes(suffix_nodes, suffix_count);
+    }
+
+    if (!resolved) {
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("symbol not found. Use search_graph(name_pattern=\"...\") "
+                                   "first to discover the exact qualified_name.",
+                                   true);
+    }
+
+    if (!node.file_path || node.file_path[0] == '\0' || node.start_line <= 0 ||
+        node.end_line < node.start_line) {
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("node has no line range — history is only available for "
+                                   "line-scoped symbols (functions, classes, methods)",
+                                   true);
+    }
+
+    char *root_path = get_project_root(srv, effective_project);
+    if (!root_path || !validate_search_path_arg(root_path) ||
+        !validate_search_path_arg(node.file_path)) {
+        free(root_path);
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("project root or file path unavailable/invalid", true);
+    }
+
+    char head[NH_SHA_BUF];
+    bool repo_shallow = false;
+    nh_git_head(root_path, head, sizeof(head), &repo_shallow);
+    if (head[0] == '\0') {
+        free(root_path);
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("not a git repository (or git not installed)", true);
+    }
+
+    /* Staleness guard: node line numbers were captured at index time. If
+     * the file changed since (mtime+size vs its hash row), they no longer
+     * anchor the working tree and the HEAD mapping below would shift the
+     * range onto the wrong lines. Reindexing refreshes the hash row, so
+     * the advice is actionable. */
+    int64_t idx_mtime = 0;
+    int64_t idx_size = 0;
+    if (cbm_store_get_file_hash(store, effective_project, node.file_path, &idx_mtime, &idx_size) ==
+        CBM_STORE_OK) {
+        char abs_path[CBM_SZ_2K];
+        snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, node.file_path);
+        struct stat st;
+        if (stat(abs_path, &st) == 0 &&
+            (cbm_stat_mtime_ns(&st) != idx_mtime || st.st_size != idx_size)) {
+            free(root_path);
+            free_node_contents(&node);
+            free(qn);
+            free(project);
+            return cbm_mcp_text_result(
+                "file changed since it was last indexed — node line numbers are stale. "
+                "Re-run index_repository and retry.",
+                true);
+        }
+    }
+
+    /* Time window: validated git dates bound the walk. Windowed queries
+     * bypass the cache both ways — a partial timeline must neither be
+     * served from nor persisted to the full-timeline cache. */
+    char *since = cbm_mcp_get_string_arg(args, "since");
+    char *until = cbm_mcp_get_string_arg(args, "until");
+    if ((since && !cbm_nh_valid_git_date(since)) || (until && !cbm_nh_valid_git_date(until))) {
+        free(since);
+        free(until);
+        free(root_path);
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("invalid since/until — use a git date like \"2026-01-01\" "
+                                   "or \"3 months ago\"",
+                                   true);
+    }
+    bool windowed = since != NULL || until != NULL;
+
+    /* Uncommitted edits shift indexed line numbers away from HEAD — map
+     * the range back to HEAD coordinates before tracking. */
+    int track_start = node.start_line;
+    int track_end = node.end_line;
+    bool wt_modified = false;
+    bool wt_overlap = false;
+    bool wt_uncommitted = false;
+    if (!nh_map_range_to_head(root_path, node.file_path, &track_start, &track_end, &wt_modified,
+                              &wt_overlap, &wt_uncommitted)) {
+        free(since);
+        free(until);
+        free(root_path);
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("git diff timed out while mapping the symbol's line range — "
+                                   "the repository is too expensive to query right now",
+                                   true);
+    }
+
+    /* Cache check: valid while the repo HEAD hasn't moved AND the mapped
+     * range is exact — clean file, or edits that leave the symbol's HEAD
+     * range untouched (no overlap, zero shift). Patch text is never cached
+     * (sparse storage) — include_patch re-runs git, bounded to patch_limit
+     * commits on a hit. */
+    char cached_head[NH_SHA_BUF];
+    cbm_store_get_node_revision_head(store, effective_project, node.qualified_name, cached_head,
+                                     sizeof(cached_head));
+    bool range_exact = !wt_modified || (!wt_overlap && track_start == node.start_line &&
+                                        track_end == node.end_line);
+    bool cache_hit = !windowed && range_exact && cached_head[0] != '\0' &&
+                     strcmp(cached_head, head) == 0;
+
+    nh_rev_t *fresh = NULL;
+    int fresh_count = 0;
+    if (wt_uncommitted) {
+        /* The whole symbol is a working-tree insertion: it has no lines at
+         * HEAD, so there is no history to compute (and nothing to cache). */
+        cache_hit = false;
+    } else if (!cache_hit || include_patch) {
+        nh_log_opts_t opts = {
+            .want_patch = include_patch,
+            .patch_limit = patch_limit,
+            .max_count = (cache_hit && include_patch) ? patch_limit : NH_MAX_REVS,
+            .since = since,
+            .until = until,
+        };
+        fresh_count =
+            nh_run_git_log(root_path, node.file_path, track_start, track_end, &opts, &fresh);
+        if (fresh_count < 0) {
+            const char *msg =
+                wt_overlap ? "git log failed for this range — the symbol has uncommitted edits; "
+                             "history is only available once its lines exist at HEAD"
+                           : "git log failed for this range — the index may be stale (file "
+                             "changed since last index). Re-run index_repository and retry.";
+            if (fresh_count == NH_GIT_TIMEOUT) {
+                msg = "git log timed out — the history walk is too expensive for this range. "
+                      "Bound it with since/until (e.g. since=\"6 months ago\") and retry.";
+            }
+            free(since);
+            free(until);
+            free(root_path);
+            free_node_contents(&node);
+            free(qn);
+            free(project);
+            return cbm_mcp_text_result(msg, true);
+        }
+        /* Persist metadata (sparse: no patch text) — only for full, exact
+         * computations: a patch-limited re-run on a hit must not truncate
+         * the cached timeline, an overlap-approximated range must not
+         * poison the entry served for a later clean tree at the same HEAD,
+         * and a windowed walk is partial by construction. */
+        if (!cache_hit && !wt_overlap && !windowed) {
+            cbm_node_revision_t *rows =
+                calloc(fresh_count ? fresh_count : SKIP_ONE, sizeof(*rows));
+            if (rows) {
+                for (int i = 0; i < fresh_count; i++) {
+                    rows[i].sha = fresh[i].sha;
+                    rows[i].ts = fresh[i].ts;
+                    rows[i].author = fresh[i].author;
+                    rows[i].subject = fresh[i].subject;
+                    rows[i].added = fresh[i].added;
+                    rows[i].deleted = fresh[i].deleted;
+                }
+                cbm_store_replace_node_revisions(store, effective_project, node.qualified_name,
+                                                 rows, fresh_count, head);
+                free(rows);
+            }
+        }
+    }
+
+    /* Serve computed results from `fresh` directly (git's newest-first
+     * order, patches aligned by construction); read the cache table only
+     * on a hit. The persist above is best-effort — a store failure must
+     * not turn a freshly computed timeline into a silent empty result. */
+    cbm_node_revision_t *revs = NULL;
+    int rev_count = 0;
+    if (cache_hit && cbm_store_get_node_revisions(store, effective_project, node.qualified_name,
+                                                  &revs, &rev_count) != CBM_STORE_OK) {
+        nh_free_revs(fresh, fresh_count);
+        free(since);
+        free(until);
+        free(root_path);
+        free_node_contents(&node);
+        free(qn);
+        free(project);
+        return cbm_mcp_text_result("failed to read cached history from the graph DB", true);
+    }
+    int total = cache_hit ? rev_count : fresh_count;
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root_obj);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "qualified_name", node.qualified_name);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "file", node.file_path);
+    yyjson_mut_obj_add_int(doc, root_obj, "start_line", node.start_line);
+    yyjson_mut_obj_add_int(doc, root_obj, "end_line", node.end_line);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "cache",
+                              cache_hit ? "hit" : (wt_modified ? "computed_dirty" : "computed"));
+    if (repo_shallow) {
+        /* Shallow clone: the walk stops at the graft boundary, so the
+         * timeline is truncated by clone depth, not real history. */
+        yyjson_mut_obj_add_bool(doc, root_obj, "shallow", true);
+    }
+    if (since) {
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "since", since);
+    }
+    if (until) {
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "until", until);
+    }
+    if (wt_modified) {
+        /* Uncommitted edits: indexed lines were remapped to HEAD coords. */
+        yyjson_mut_obj_add_int(doc, root_obj, "tracked_start_at_head", track_start);
+        yyjson_mut_obj_add_int(doc, root_obj, "tracked_end_at_head", track_end);
+    }
+    if (wt_uncommitted) {
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "note",
+                                  "this symbol is not committed at HEAD yet — its history "
+                                  "starts with its first commit");
+    } else if (wt_overlap) {
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "note",
+                                  "this symbol has uncommitted edits — history reflects HEAD; "
+                                  "the working-tree change is not a commit yet");
+    }
+    yyjson_mut_obj_add_int(doc, root_obj, "total_revisions", total);
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    int emit = total < limit ? total : limit;
+    if (cache_hit) {
+        for (int i = 0; i < emit; i++) {
+            const char *patch = NULL;
+            bool truncated = false;
+            for (int j = 0; include_patch && fresh && j < fresh_count && j < patch_limit; j++) {
+                if (fresh[j].patch && strcmp(fresh[j].sha, revs[i].sha) == 0) {
+                    patch = fresh[j].patch;
+                    truncated = fresh[j].patch_truncated;
+                    break;
+                }
+            }
+            nh_emit_rev(doc, arr, revs[i].sha, revs[i].ts, revs[i].author, revs[i].subject,
+                        revs[i].added, revs[i].deleted, patch, truncated);
+        }
+    } else {
+        for (int i = 0; i < emit; i++) {
+            bool with_patch = include_patch && i < patch_limit && fresh[i].patch;
+            nh_emit_rev(doc, arr, fresh[i].sha, fresh[i].ts, fresh[i].author, fresh[i].subject,
+                        fresh[i].added, fresh[i].deleted, with_patch ? fresh[i].patch : NULL,
+                        with_patch && fresh[i].patch_truncated);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root_obj, "revisions", arr);
+
+    if (co_changed) {
+        yyjson_mut_val *cc = yyjson_mut_arr(doc);
+        const char *shas[NH_COCHANGE_SHAS];
+        int nsha = 0;
+        int src_count = cache_hit ? rev_count : fresh_count;
+        for (int i = 0; i < src_count && nsha < NH_COCHANGE_SHAS; i++) {
+            shas[nsha++] = cache_hit ? revs[i].sha : fresh[i].sha;
+        }
+        nh_add_co_changed(doc, cc, root_path, node.file_path, shas, nsha);
+        yyjson_mut_obj_add_val(doc, root_obj, "co_changed_files", cc);
+    }
+
+    cbm_store_free_node_revisions(revs, rev_count);
+    nh_free_revs(fresh, fresh_count);
+    free(since);
+    free(until);
+    free(root_path);
+    free_node_contents(&node);
+    free(qn);
+    free(project);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -4209,6 +5080,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "detect_changes") == 0) {
         return handle_detect_changes(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_node_history") == 0) {
+        return handle_get_node_history(srv, args_json);
     }
     if (strcmp(tool_name, "manage_adr") == 0) {
         return handle_manage_adr(srv, args_json);
